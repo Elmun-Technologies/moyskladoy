@@ -17,7 +17,7 @@ const DAY_MS = 24 * 3600 * 1000;
 
 export async function scheduleRules(db: Database, now: Date = new Date(), limitUsers = 1000): Promise<number> {
   let enqueued = 0;
-  const dayKey = tashkentDayKey(now);
+  const dayKey = tashkentDayKey(now); // nurture uchun saqlanadi (kunlik cheklov)
   const { users } = await db.listUsers({ limit: limitUsers, offset: 0 });
   for (const u of users) {
     const st = u.state;
@@ -64,8 +64,9 @@ export async function scheduleRules(db: Database, now: Date = new Date(), limitU
   return enqueued;
 }
 
-async function push(db: Database, userId: string, kind: string, dayKey: string, blockKey: string, now: Date): Promise<number> {
-  const r = await db.enqueueOutbox({ userId, type: 'reminder', dedupeKey: `reminder:${userId}:${kind}:${dayKey}`, payload: { blockKey }, scheduledFor: clampWindow(now) });
+async function push(db: Database, userId: string, kind: string, _dayKey: string, blockKey: string, now: Date): Promise<number> {
+  // Spec: intro/lesson/offers eslatmalari UMRI BO'YI BIR MARTA (keyin jim).
+  const r = await db.enqueueOutbox({ userId, type: 'reminder', dedupeKey: `reminder:${userId}:${kind}:once`, payload: { blockKey }, scheduledFor: clampWindow(now) });
   return r ? 1 : 0;
 }
 

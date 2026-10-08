@@ -118,3 +118,42 @@ describe('reminder scheduling', () => {
     expect(w!.getTime()).toBeGreaterThan(OUT_WINDOW.getTime());
   });
 });
+
+describe('followup qoshimcha kafolatlari', () => {
+  it("intro eslatma umri bo'yi bir marta (3 kun - baribir 1 ta)", async () => {
+    const uid = await makeUser(601, 'START');
+    await db.grantConsent(uid, 'marketing', 'v1');
+    await db.updateState(uid, { updatedAt: new Date(IN_WINDOW.getTime() - 25 * 3600 * 1000) });
+    expect(await scheduleRules(db, IN_WINDOW)).toBe(1);
+    const d2 = new Date(IN_WINDOW.getTime() + 24 * 3600 * 1000);
+    const d3 = new Date(IN_WINDOW.getTime() + 48 * 3600 * 1000);
+    expect(await scheduleRules(db, d2)).toBe(0);
+    expect(await scheduleRules(db, d3)).toBe(0);
+    const items = await db.listOutbox({ userId: uid });
+    expect(items.length).toBe(1);
+  });
+
+  it("worker 'sending' da o'lsa - keyingi tick'da tiklanadi (qotib qolmaydi)", async () => {
+    const uid = await makeUser(602, 'START');
+    await db.enqueueOutbox({ userId: uid, type: 'notification', dedupeKey: 'n-stale', payload: { chatId: 5, text: 'salom' }, scheduledFor: new Date(IN_WINDOW.getTime() - 20 * 60 * 1000) });
+    const item = (await db.listOutbox({ userId: uid }))[0]!;
+    await db.updateOutbox(item.id, { status: 'sending' });
+    const recovered = await sender.recoverStaleSending(IN_WINDOW);
+    expect(recovered).toBe(1);
+    const after = (await db.listOutbox({ userId: uid }))[0]!;
+    expect(after.status).toBe('pending');
+    expect(after.lastError).toContain('stale_sending_recovered');
+    msg.clear();
+    const r = await sender.processDue(IN_WINDOW);
+    expect(r.sent).toBe(1);
+  });
+
+  it('zaqor (poison) xabar cheksiz aylanmaydi - attempts yetganda failed', async () => {
+    const uid = await makeUser(603, 'START');
+    await db.enqueueOutbox({ userId: uid, type: 'notification', dedupeKey: 'n-poison', payload: { chatId: 5, text: 'x' }, scheduledFor: new Date(IN_WINDOW.getTime() - 20 * 60 * 1000) });
+    const item = (await db.listOutbox({ userId: uid }))[0]!;
+    await db.updateOutbox(item.id, { status: 'sending', attempts: 4 });
+    await sender.recoverStaleSending(IN_WINDOW);
+    expect((await db.listOutbox({ userId: uid }))[0]!.status).toBe('failed');
+  });
+});

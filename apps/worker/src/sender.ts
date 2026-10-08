@@ -55,8 +55,36 @@ export class OutboxSender {
     this.opts.log?.(l, m);
   }
 
+  /**
+   * Worker 'sending' holatida o'lsa - xabar shu yerda qotib qolardi.
+   * Har tick boshida eskirgan (staleMs+) 'sending' yozuvlarini topib,
+   * pending'ga qaytaramiz (attempts+1 bilan - zaqor xabar cheksiz aylanmaydi).
+   * E'tibor: bu "duplicate bo'lishi mumkin" ehtimolini ochiq qoldiradi -
+   * biz hech qachon exactly-once deb da'vo qilmaymiz.
+   */
+  async recoverStaleSending(now: Date, staleMs = 10 * 60 * 1000): Promise<number> {
+    let recovered = 0;
+    const items = await this.db.listOutbox({ status: 'sending', limit: 100 });
+    for (const m of items) {
+      const age = now.getTime() - (m.scheduledFor?.getTime?.() ?? 0);
+      if (age < staleMs) continue;
+      const attempts = m.attempts + 1;
+      await this.db.updateOutbox(m.id, {
+        status: attempts >= this.maxAttempts ? 'failed' : 'pending',
+        attempts,
+        scheduledFor: now,
+        nextAttemptAt: now,
+        lastError: 'stale_sending_recovered',
+      });
+      recovered++;
+    }
+    if (recovered) this.log('warn', `recovered ${recovered} stale 'sending' outbox rows`);
+    return recovered;
+  }
+
   async processDue(now: Date = new Date(), limit = 50): Promise<ProcessResult> {
     const res: ProcessResult = { sent: 0, cancelled: 0, retried: 0, failed: 0, deferred: 0 };
+    await this.recoverStaleSending(now);
     const due = await this.db.listDueOutbox(now, limit);
     for (const m of due) {
       try {
