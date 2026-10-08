@@ -40,6 +40,63 @@
 - Loglar sanitizatsiyalangan (telefonlar maskPhone bilan) - baribir log fayllarini
   cheklangan saqlash muddati bilan saqlang.
 
+
+## Fly.io deploy (bizning server)
+
+Tayyor konfiguratsiyalar: `Dockerfile` (root) + `deploy/fly/fly.web.toml` +
+`deploy/fly/fly.admin.toml`. Kerakli: `flyctl` o'rnatilgan va `fly auth login`.
+
+1. **Asosiy app** (api+bot+worker, bitta image, 3 process group):
+
+   ```bash
+   fly apps create moyskladoy
+   fly postgres create --name moyskladoy-db --vm-size shared-cpu-1x \
+     --initial-cluster-size 1 --volume-size 5
+   fly postgres attach moyskladoy-db --app moyskladoy   # DATABASE_URL auto
+   fly volume create moyskladoy_data --app moyskladoy   # MEDIA_DIR uchun
+   fly secrets set TELEGRAM_BOT_TOKEN=... BOT_USERNAME=... \
+     SESSION_SECRET="$(openssl rand -hex 32)" IP_HASH_SALT="$(openssl rand -hex 32)" \
+     ADMIN_EMAIL=... ADMIN_PASSWORD=... SALES_GROUP_CHAT_ID=... \
+     SALES_STAFF_TELEGRAM_IDS=... CORS_ORIGINS=https://<sayt-domene> --app moyskladoy
+   fly deploy --config deploy/fly/fly.web.toml
+   fly ssh console -C "npm run db:migrate:deploy -w @app/db"
+   fly ssh console -C "npm run db:seed -w @app/db"
+   ```
+
+2. **Admin panel** (alohida app, ichki tarmoq orqali API'ga ulanadi):
+
+   ```bash
+   fly apps create moyskladoy-admin
+   fly deploy --config deploy/fly/fly.admin.toml
+   ```
+
+3. **Bot rejimi:** toml'da `BOT_MODE=polling` - webhook, sertifikat, domain
+   sozlash shart emas (bot o'zi Telegram'dan yangi oladi). Webhook kerak
+   bo'lsa: `BOT_MODE=webhook` secret bilan + docs yuqoridagi 5-band.
+
+4. **Redis kerak emas:** `REDIS_URL` bo'lmasa worker in-process interval
+   navbatda ishlaydi (bir machina uchun to'liq yetarli; reminder-lar
+   DB outbox'da, u qismidan holat saqlanadi). Keyinchalik parallel
+   bot/worker instance kerak bo'lsa - Upstash Redis qo'shib `REDIS_URL`
+   secret'ini bering.
+
+5. **Demo sahifa** (`GET /` api'da) `https://moyskladoy.fly.dev` da ochiladi -
+   sayt formasi + bot simulyatori. Haqiqiy sayt formasini boshqa domendan
+   chaqirsangiz, o'sha domenni `CORS_ORIGINS`ga qo'shing.
+
+6. **Yangilash:** `git push` -> `fly deploy --config ...` (ikkala app uchun
+   alohida). Rollback: `fly releases rollback` yoki eski commitga
+   `git checkout` + qayta deploy (migratsiyalar backward-compatible).
+
+7. **Cheklovlar:** `auto_stop_machines="stop"` bo'lsa idle'da bot/worker
+   to'xtamaydi (faqat app group processes'da) - reminderlar uzluksiz ishlashi
+   uchun web group ham `min_machines_running=1` qilingan. Full-time ish
+   hajmi uchun hisobni kuzating; kerak bo'lsa `fly scale memory 512`.
+
+Eslatma: Fly'dagi birinchi deploy'da Docker build remote builder'da ketadi
+(~3-5 daqiqa). Bu sandbox'da docker/build qatlam sinovdan o'tkazilmagan -
+birinchi `fly deploy`'ni kuzatib chiqing.
+
 ## Sessiyalar eslatmasi
 
 Hozirgi admin sessiyalari API jarayonining xotirasida. Multi-instance deploy'da

@@ -1,0 +1,29 @@
+# ============================================================================
+# Fly.io - admin panel (Next.js standalone, alohida app).
+# Panel /api/* so'rovlarini ichki tarmoq orqali asosiy app'ga proksi qiladi
+# (API_INTERNAL_URL) - shuning uchun brauzer CORS'ini sozlash shart emas,
+# cookie'lar same-origin yuboriladi.
+#
+#   fly apps create moyskladoy-admin
+#   fly deploy --config deploy/fly/fly.admin.toml
+# ============================================================================
+app = "moyskladoy-admin"
+primary_region = "cdg"
+
+[build]
+dockerfile = "../../apps/admin/Dockerfile"
+
+[env]
+# moyskladoy - fly.web.toml'dagi asosiy app nomi; .internal - Fly private networking.
+API_INTERNAL_URL = "http://moyskladoy.internal:4000"
+
+[http_service]
+internal_port = 3000
+force_https = true
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"

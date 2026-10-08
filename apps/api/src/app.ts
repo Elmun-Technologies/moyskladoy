@@ -43,6 +43,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
   if (cfg.corsOrigins.length > 0) await app.register(cors, { origin: cfg.corsOrigins, credentials: true });
 
+  // Fly/uptime tekshiruvi uchun (DB'ga yengil probe; ma'lumot chiqarmaydi).
+  app.get('/healthz', async (_req, reply) => {
+    try {
+      await db.getSetting('healthz_probe');
+      return { ok: true, mode: cfg.demoMode ? 'demo' : 'prod', ts: new Date().toISOString() };
+    } catch {
+      reply.code(503);
+      return { ok: false };
+    }
+  });
+
   // --- sayt formasi ---------------------------------------------------------
   const SiteLeadSchema = z.object({
     name: z.string().trim().min(2).max(100),
