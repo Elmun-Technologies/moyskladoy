@@ -1,4 +1,4 @@
-const api = process.env.API_INTERNAL_URL ?? 'http://localhost:4000';
+const api = process.env.API_INTERNAL_URL ?? 'https://moyskladoy.fly.dev';
 /** /api/* -> Fastify API (same-origin: cookie'lar CORS'siz ishlaydi). */
 const config = {
   output: 'standalone',

@@ -8,14 +8,14 @@
 #   fly deploy --config deploy/fly/fly.admin.toml
 # ============================================================================
 app = "moyskladoy-admin"
-primary_region = "cdg"
+primary_region = "sin"
 
 [build]
-dockerfile = "../../apps/admin/Dockerfile"
+dockerfile = "apps/admin/Dockerfile"
 
 [env]
 # moyskladoy - fly.web.toml'dagi asosiy app nomi; .internal - Fly private networking.
-API_INTERNAL_URL = "http://moyskladoy.internal:4000"
+API_INTERNAL_URL = "https://moyskladoy.fly.dev"
 
 [http_service]
 internal_port = 3000
