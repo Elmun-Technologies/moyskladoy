@@ -3,6 +3,19 @@ import type {
   AdminUser,
   AnalyticsEvent,
   AuditLogEntry,
+  Campaign,
+  CampaignChannel,
+  CampaignDeliverySummary,
+  CampaignRecipient,
+  RetentionCohort,
+  SavedSegment,
+  SegmentFilters,
+  SmsMessage,
+  SmsMessageStatus,
+  StageFunnelPoint,
+  StageFunnelRow,
+  StageProgress,
+  UserPhone,
   Consent,
   ContentBlock,
   ConversationEvent,
@@ -59,12 +72,14 @@ export class PrismaDatabase implements Database {
         firstName: input.firstName ?? null,
         lastName: input.lastName ?? null,
         languageCode: input.languageCode ?? null,
+        lastSeenAt: new Date(),
       },
       update: {
         username: input.username ?? undefined,
         firstName: input.firstName ?? undefined,
         lastName: input.lastName ?? undefined,
         languageCode: input.languageCode ?? undefined,
+        lastSeenAt: new Date(),
       },
     });
     return this.mapUser(u);
@@ -132,6 +147,40 @@ export class PrismaDatabase implements Database {
       users: rows.map((u: AnyRecord) => ({ ...this.mapUser(u), state: u.state ? this.mapState(u.state) : null })),
       total,
     };
+  }
+
+  private mapUserPhone(row: AnyRecord): UserPhone {
+    return { id: row.id, userId: row.userId, phone: row.phone, verified: row.verified, smsConsent: row.smsConsent, updatedAt: toDate(row.updatedAt) };
+  }
+
+  async upsertUserPhone(userId: string, phone: string, patch: { verified?: boolean; smsConsent?: boolean } = {}): Promise<UserPhone> {
+    const row = await this.prisma.userPhone.upsert({
+      where: { userId },
+      create: { userId, phone, verified: patch.verified ?? false, smsConsent: patch.smsConsent ?? false },
+      update: { phone, verified: patch.verified, smsConsent: patch.smsConsent },
+    });
+    return this.mapUserPhone(row);
+  }
+
+  async getUserPhone(userId: string): Promise<UserPhone | null> {
+    const row = await this.prisma.userPhone.findUnique({ where: { userId } });
+    return row ? this.mapUserPhone(row) : null;
+  }
+
+  async getUserPhoneByPhone(phone: string): Promise<UserPhone | null> {
+    const row = await this.prisma.userPhone.findUnique({ where: { phone } });
+    return row ? this.mapUserPhone(row) : null;
+  }
+
+  async updateUserPhone(userId: string, patch: Partial<Pick<UserPhone, 'phone' | 'verified' | 'smsConsent'>>): Promise<UserPhone> {
+    const row = await this.prisma.userPhone.update({ where: { userId }, data: patch });
+    return this.mapUserPhone(row);
+  }
+
+  async countSmsSentToPhoneSince(phone: string, since: Date): Promise<number> {
+    // Count provider-accepted messages even if a later delivery report marks them failed;
+    // the weekly cap limits dispatches per phone, not only successful deliveries.
+    return this.prisma.smsMessage.count({ where: { phone, status: { in: ['sent', 'delivered', 'failed'] }, sentAt: { gte: since } } });
   }
 
   // --- Sayt so'rovlari va tokenlar ------------------------------------------
@@ -291,6 +340,92 @@ export class PrismaDatabase implements Database {
       payload: e.payload ?? null,
       createdAt: toDate(e.createdAt),
     }));
+  }
+
+  private mapStageProgress(row: AnyRecord): StageProgress {
+    return { id: row.id, userId: row.userId, stageKey: row.stageKey, stepOrder: row.stepOrder, enteredAt: toDate(row.enteredAt), completedAt: row.completedAt ? toDate(row.completedAt) : null, exitReason: row.exitReason ?? null };
+  }
+
+  async upsertStageProgress(userId: string, stageKey: string, stepOrder: number, enteredAt = new Date()): Promise<StageProgress> {
+    const row = await this.prisma.stageProgress.upsert({
+      where: { userId_stageKey: { userId, stageKey } },
+      create: { userId, stageKey, stepOrder, enteredAt },
+      // Keep the first entry/completion timestamps: revisiting a stage must not
+      // erase historical funnel conversion or restart the stuck-stage clock.
+      update: { stepOrder },
+    });
+    return this.mapStageProgress(row);
+  }
+
+  async completeStageProgress(userId: string, stageKey: string, completedAt = new Date(), reason: StageProgress['exitReason'] = 'completed'): Promise<StageProgress | null> {
+    const found = await this.prisma.stageProgress.findUnique({ where: { userId_stageKey: { userId, stageKey } } });
+    if (!found) return null;
+    const row = await this.prisma.stageProgress.update({ where: { userId_stageKey: { userId, stageKey } }, data: { completedAt, exitReason: reason } });
+    return this.mapStageProgress(row);
+  }
+
+  async listStageProgress(filter?: { userIds?: string[]; stageKey?: string; from?: Date; to?: Date; limit?: number }): Promise<StageProgress[]> {
+    const rows = await this.prisma.stageProgress.findMany({
+      where: {
+        ...(filter?.userIds ? { userId: { in: filter.userIds } } : {}),
+        ...(filter?.stageKey ? { stageKey: filter.stageKey } : {}),
+        ...((filter?.from || filter?.to) ? { enteredAt: { ...(filter?.from ? { gte: filter.from } : {}), ...(filter?.to ? { lte: filter.to } : {}) } } : {}),
+      },
+      orderBy: [{ stepOrder: 'asc' }, { enteredAt: 'asc' }],
+      take: filter?.limit ?? 100000,
+    });
+    return rows.map((r: AnyRecord) => this.mapStageProgress(r));
+  }
+
+  async getStageFunnel(from: Date, to: Date, stuckAfterDays = 7): Promise<StageFunnelRow[]> {
+    // Single grouped SQL query avoids a query per stage and computes exact median in PostgreSQL.
+    const rows = await this.prisma.$queryRawUnsafe(`
+      SELECT "stageKey", MIN("stepOrder")::int AS "stepOrder",
+        COUNT(DISTINCT "userId")::int AS viewed,
+        COUNT(DISTINCT "userId") FILTER (WHERE "completedAt" IS NOT NULL)::int AS completed,
+        COUNT(DISTINCT "userId") FILTER (WHERE "completedAt" IS NULL AND "enteredAt" <= $2 - ($3 * INTERVAL '1 day'))::int AS stuck,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM ("completedAt" - "enteredAt")) / 60.0)
+          FILTER (WHERE "completedAt" IS NOT NULL) AS "medianMinutes"
+      FROM "StageProgress"
+      WHERE "enteredAt" >= $1 AND "enteredAt" <= $2
+      GROUP BY "stageKey" ORDER BY MIN("stepOrder"), "stageKey"
+    `, from, to, stuckAfterDays) as AnyRecord[];
+    return rows.map((r) => {
+      const viewed = Number(r.viewed ?? 0);
+      const completed = Number(r.completed ?? 0);
+      return { stageKey: String(r.stageKey), stepOrder: Number(r.stepOrder ?? 0), viewed, completed, stuck: Number(r.stuck ?? 0), conversionPct: viewed ? Math.round(completed / viewed * 10000) / 100 : 0, medianMinutes: r.medianMinutes === null || r.medianMinutes === undefined ? null : Number(r.medianMinutes) };
+    });
+  }
+
+  async getStageFunnelSeries(from: Date, to: Date, by: 'day' | 'week'): Promise<StageFunnelPoint[]> {
+    const trunc = by === 'week' ? 'week' : 'day';
+    const rows = await this.prisma.$queryRawUnsafe(`
+      SELECT date_trunc('${trunc}', "enteredAt") AS bucket, "stageKey", MIN("stepOrder")::int AS "stepOrder",
+        COUNT(DISTINCT "userId")::int AS viewed,
+        COUNT(DISTINCT "userId") FILTER (WHERE "completedAt" IS NOT NULL)::int AS completed,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM ("completedAt" - "enteredAt")) / 60.0)
+          FILTER (WHERE "completedAt" IS NOT NULL) AS "medianMinutes"
+      FROM "StageProgress" WHERE "enteredAt" >= $1 AND "enteredAt" <= $2
+      GROUP BY bucket, "stageKey" ORDER BY bucket, MIN("stepOrder"), "stageKey"
+    `, from, to) as AnyRecord[];
+    return rows.map((r) => {
+      const viewed = Number(r.viewed ?? 0);
+      const completed = Number(r.completed ?? 0);
+      const date = toDate(r.bucket);
+      return { bucket: date.toISOString().slice(0, 10), stageKey: String(r.stageKey), stepOrder: Number(r.stepOrder ?? 0), viewed, completed, stuck: 0, conversionPct: viewed ? Math.round(completed / viewed * 10000) / 100 : 0, medianMinutes: r.medianMinutes === null || r.medianMinutes === undefined ? null : Number(r.medianMinutes) };
+    });
+  }
+
+  async getRetentionCohorts(from: Date, to: Date): Promise<RetentionCohort[]> {
+    const rows = await this.prisma.$queryRawUnsafe(`
+      SELECT date_trunc('week', "createdAt") AS bucket, COUNT(*)::int AS users,
+        COUNT(*) FILTER (WHERE "lastSeenAt" >= "createdAt" + INTERVAL '1 day' AND "lastSeenAt" <= $2)::int AS d1,
+        COUNT(*) FILTER (WHERE "lastSeenAt" >= "createdAt" + INTERVAL '7 days' AND "lastSeenAt" <= $2)::int AS d7,
+        COUNT(*) FILTER (WHERE "lastSeenAt" >= "createdAt" + INTERVAL '30 days' AND "lastSeenAt" <= $2)::int AS d30
+      FROM "TelegramUser" WHERE "createdAt" >= $1 AND "createdAt" <= $2
+      GROUP BY bucket ORDER BY bucket
+    `, from, to) as AnyRecord[];
+    return rows.map((r) => ({ bucket: toDate(r.bucket).toISOString().slice(0, 10), users: Number(r.users), d1: Number(r.d1), d7: Number(r.d7), d30: Number(r.d30) }));
   }
 
   // --- Roziliklar -----------------------------------------------------------
@@ -800,6 +935,224 @@ export class PrismaDatabase implements Database {
     return this.mapHelp(h);
   }
 
+  // --- Segmentlar / kampaniyalar / SMS -------------------------------------
+
+  private segmentWhere(filters: SegmentFilters, channel: CampaignChannel, campaignId?: string): AnyRecord {
+    const and: AnyRecord[] = [];
+    // Campaign audiences include only recipients legally eligible for the channel.
+    and.push({ blockedAt: null });
+    if (channel === 'telegram') and.push({ consents: { some: { type: 'marketing', revokedAt: null } } });
+    if (channel === 'sms') {
+      and.push({ phone: { is: { smsConsent: true } } });
+      and.push({ consents: { some: { type: 'sms_marketing', revokedAt: null } } });
+    }
+    if (filters.blocked === true) and.push({ blockedAt: { not: null } });
+    if (filters.languageCode) and.push({ languageCode: filters.languageCode });
+    if (filters.createdBetween) {
+      const range: AnyRecord = {};
+      if (filters.createdBetween.from) range.gte = new Date(filters.createdBetween.from);
+      if (filters.createdBetween.to) range.lte = new Date(filters.createdBetween.to);
+      and.push({ createdAt: range });
+    }
+    if (filters.lastActiveBetween) {
+      const range: AnyRecord = {};
+      if (filters.lastActiveBetween.from) range.gte = new Date(filters.lastActiveBetween.from);
+      if (filters.lastActiveBetween.to) range.lte = new Date(filters.lastActiveBetween.to);
+      and.push({ lastSeenAt: range });
+    }
+    if (filters.stageKey) {
+      if (filters.stuckLongerThanDays !== undefined) {
+        const before = new Date(Date.now() - filters.stuckLongerThanDays * 86_400_000);
+        and.push({ stageProgress: { some: { stageKey: filters.stageKey, completedAt: null, enteredAt: { lte: before } } } });
+      } else {
+        and.push({ OR: [{ state: { is: { stage: filters.stageKey } } }, { stageProgress: { some: { stageKey: filters.stageKey, completedAt: null } } }] });
+      }
+    }
+    if (filters.anyStageIn?.length) and.push({ stageProgress: { some: { stageKey: { in: filters.anyStageIn } } } });
+    if (filters.neverReached?.length) and.push({ stageProgress: { none: { stageKey: { in: filters.neverReached } } } });
+    if (filters.consentMarketing === true) and.push({ consents: { some: { type: 'marketing', revokedAt: null } } });
+    if (filters.consentMarketing === false) and.push({ consents: { none: { type: 'marketing', revokedAt: null } } });
+    if (filters.hasPhone === true) and.push({ phone: { isNot: null } });
+    if (filters.hasPhone === false) and.push({ phone: { is: null } });
+    if (filters.smsConsent === true) {
+      and.push({ phone: { is: { smsConsent: true } } });
+      and.push({ consents: { some: { type: 'sms_marketing', revokedAt: null } } });
+    }
+    if (filters.smsConsent === false) and.push({ OR: [
+      { phone: { is: null } },
+      { phone: { is: { smsConsent: false } } },
+      { consents: { none: { type: 'sms_marketing', revokedAt: null } } },
+    ] });
+    if (filters.leadStatus) and.push({ salesLeads: { some: { status: filters.leadStatus } } });
+    if (filters.viewedProductIds?.length) and.push({ productViews: { some: { productId: { in: filters.viewedProductIds } } } });
+    if (campaignId && channel === 'telegram') and.push({ outbox: { none: { campaignId } } });
+    if (campaignId && channel === 'sms') and.push({ smsMessages: { none: { campaignId, isTest: false } } });
+    return { AND: and };
+  }
+
+  private mapCampaign(c: AnyRecord): Campaign {
+    return {
+      id: c.id, name: c.name, channel: c.channel, segmentJson: (c.segmentJson ?? {}) as SegmentFilters,
+      templateText: c.templateText, buttonsJson: (c.buttonsJson ?? null) as unknown[] | null, mediaId: c.mediaId,
+      status: c.status, scheduledFor: c.scheduledFor ? toDate(c.scheduledFor) : null,
+      smsConfirmedAt: c.smsConfirmedAt ? toDate(c.smsConfirmedAt) : null, createdById: c.createdById,
+      startsAt: c.startsAt ? toDate(c.startsAt) : null, endsAt: c.endsAt ? toDate(c.endsAt) : null,
+      statsCache: (c.statsCache ?? null) as Record<string, unknown> | null,
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    };
+  }
+
+  private mapCampaignRecipient(row: AnyRecord): CampaignRecipient {
+    return {
+      user: this.mapUser(row),
+      state: row.state ? this.mapState(row.state) : null,
+      phone: row.phone ? this.mapUserPhone(row.phone) : null,
+    };
+  }
+
+  async previewSegment(filters: SegmentFilters, channel: CampaignChannel): Promise<{ count: number; sample: CampaignRecipient[] }> {
+    const where = this.segmentWhere(filters, channel);
+    const [count, rows] = await Promise.all([
+      this.prisma.telegramUser.count({ where }),
+      this.prisma.telegramUser.findMany({ where, include: { state: true, phone: true }, orderBy: { createdAt: 'asc' }, take: 10 }),
+    ]);
+    return { count, sample: rows.map((r: AnyRecord) => this.mapCampaignRecipient(r)) };
+  }
+
+  async listSegmentRecipients(filters: SegmentFilters, channel: CampaignChannel, campaignId: string, limit = 500): Promise<CampaignRecipient[]> {
+    const rows = await this.prisma.telegramUser.findMany({
+      where: this.segmentWhere(filters, channel, campaignId),
+      include: { state: true, phone: true },
+      orderBy: { createdAt: 'asc' },
+      take: Math.min(Math.max(limit, 1), 5000),
+    });
+    return rows.map((r: AnyRecord) => this.mapCampaignRecipient(r));
+  }
+
+  private mapSavedSegment(row: AnyRecord): SavedSegment {
+    return { id: row.id, name: row.name, ownerId: row.ownerId, filtersJson: (row.filtersJson ?? {}) as SegmentFilters, createdAt: toDate(row.createdAt) };
+  }
+
+  async listSavedSegments(): Promise<SavedSegment[]> {
+    const rows = await this.prisma.savedSegment.findMany({ orderBy: { createdAt: 'desc' } });
+    return rows.map((r: AnyRecord) => this.mapSavedSegment(r));
+  }
+
+  async createSavedSegment(input: Omit<SavedSegment, 'id' | 'createdAt'>): Promise<SavedSegment> {
+    const row = await this.prisma.savedSegment.create({ data: { name: input.name, ownerId: input.ownerId, filtersJson: input.filtersJson } });
+    return this.mapSavedSegment(row);
+  }
+
+  async deleteSavedSegment(id: string): Promise<boolean> {
+    const result = await this.prisma.savedSegment.deleteMany({ where: { id } });
+    return result.count > 0;
+  }
+
+  async createCampaign(input: Omit<Campaign, 'id' | 'startsAt' | 'endsAt' | 'statsCache' | 'createdAt' | 'updatedAt'>): Promise<Campaign> {
+    const row = await this.prisma.campaign.create({ data: {
+      name: input.name, channel: input.channel, segmentJson: input.segmentJson, templateText: input.templateText,
+      buttonsJson: input.buttonsJson ?? null, mediaId: input.mediaId ?? null, status: input.status,
+      scheduledFor: input.scheduledFor, smsConfirmedAt: input.smsConfirmedAt ?? null, createdById: input.createdById,
+    } });
+    return this.mapCampaign(row);
+  }
+
+  async getCampaign(id: string): Promise<Campaign | null> {
+    const row = await this.prisma.campaign.findUnique({ where: { id } });
+    return row ? this.mapCampaign(row) : null;
+  }
+
+  async listCampaigns(limit = 100): Promise<Campaign[]> {
+    const rows = await this.prisma.campaign.findMany({ orderBy: { createdAt: 'desc' }, take: limit });
+    return rows.map((r: AnyRecord) => this.mapCampaign(r));
+  }
+
+  async updateCampaign(id: string, patch: Partial<Campaign>): Promise<Campaign> {
+    const data: AnyRecord = {};
+    for (const [key, value] of Object.entries(patch)) if (!['id', 'createdAt', 'updatedAt'].includes(key) && value !== undefined) data[key] = value;
+    const row = await this.prisma.campaign.update({ where: { id }, data });
+    return this.mapCampaign(row);
+  }
+
+  async getCampaignDeliverySummary(campaignId: string): Promise<CampaignDeliverySummary> {
+    const [outbox, sms] = await Promise.all([
+      this.prisma.outboxMessage.findMany({ where: { campaignId }, select: { status: true, skippedReason: true, lastError: true } }),
+      this.prisma.smsMessage.findMany({ where: { campaignId, isTest: false }, select: { status: true, skippedReason: true, lastError: true } }),
+    ]);
+    const all = [...outbox, ...sms];
+    const skipped: Record<string, number> = {};
+    for (const row of all) {
+      if (row.status !== 'cancelled') continue;
+      const raw = row.skippedReason ?? row.lastError ?? '';
+      const reason = String(raw).replace(/^skipped:/, '').split(':')[0];
+      if (!reason || reason.startsWith('cancelled')) continue;
+      const key = ['no_consent', 'consent'].includes(reason) ? 'consent' : ['outside_window', 'time'].includes(reason) ? 'time' : reason;
+      skipped[key] = (skipped[key] ?? 0) + 1;
+    }
+    return {
+      planned: all.length,
+      sent: all.filter((r: AnyRecord) => ['sent', 'delivered'].includes(r.status)).length,
+      pending: all.filter((r: AnyRecord) => ['pending', 'sending', 'queued'].includes(r.status)).length,
+      failed: all.filter((r: AnyRecord) => r.status === 'failed').length,
+      skipped,
+    };
+  }
+
+  private mapSmsMessage(row: AnyRecord): SmsMessage {
+    return { id: row.id, campaignId: row.campaignId ?? null, userId: row.userId ?? null, phone: row.phone, text: row.text, status: row.status,
+      externalId: row.externalId, lastError: row.lastError, skippedReason: row.skippedReason ?? null, attempts: row.attempts,
+      sentAt: row.sentAt ? toDate(row.sentAt) : null, reportedAt: row.reportedAt ? toDate(row.reportedAt) : null,
+      isTest: row.isTest, createdAt: toDate(row.createdAt), updatedAt: toDate(row.updatedAt) };
+  }
+
+  async createSmsMessage(input: Omit<SmsMessage, 'id' | 'attempts' | 'createdAt' | 'updatedAt'>): Promise<SmsMessage | null> {
+    if (!input.isTest && input.campaignId && input.userId) {
+      const existing = await this.prisma.smsMessage.findFirst({ where: { campaignId: input.campaignId, userId: input.userId, isTest: false } });
+      if (existing) return null;
+    }
+    try {
+      const row = await this.prisma.smsMessage.create({ data: { ...input, attempts: 0 } });
+      return this.mapSmsMessage(row);
+    } catch (e: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
+      if (e?.code === 'P2002') return null;
+      throw e;
+    }
+  }
+
+  async getSmsMessage(id: string): Promise<SmsMessage | null> {
+    const row = await this.prisma.smsMessage.findUnique({ where: { id } });
+    return row ? this.mapSmsMessage(row) : null;
+  }
+
+  async updateSmsMessage(id: string, patch: Partial<SmsMessage>): Promise<SmsMessage> {
+    const data: AnyRecord = {};
+    for (const [key, value] of Object.entries(patch)) if (!['id', 'createdAt', 'updatedAt'].includes(key) && value !== undefined) data[key] = value;
+    const row = await this.prisma.smsMessage.update({ where: { id }, data });
+    return this.mapSmsMessage(row);
+  }
+
+  async listSmsMessages(filter?: { campaignId?: string; status?: SmsMessageStatus; limit?: number; offset?: number }): Promise<SmsMessage[]> {
+    const rows = await this.prisma.smsMessage.findMany({ where: { ...(filter?.campaignId ? { campaignId: filter.campaignId } : {}), ...(filter?.status ? { status: filter.status } : {}) }, orderBy: { createdAt: 'desc' }, skip: filter?.offset ?? 0, take: filter?.limit ?? 100 });
+    return rows.map((r: AnyRecord) => this.mapSmsMessage(r));
+  }
+
+  async listAnalyticsEvents(filter?: { types?: string[]; typePrefix?: string; campaignId?: string; userIds?: string[]; from?: Date; to?: Date; limit?: number }): Promise<AnalyticsEvent[]> {
+    const where: AnyRecord = {};
+    if (filter?.types) where.type = { in: filter.types };
+    if (filter?.typePrefix) where.type = { startsWith: filter.typePrefix };
+    if (filter?.campaignId) where.properties = { path: ['campaignId'], equals: filter.campaignId };
+    if (filter?.userIds) where.userId = { in: filter.userIds };
+    if (filter?.from || filter?.to) where.createdAt = { ...(filter?.from ? { gte: filter.from } : {}), ...(filter?.to ? { lte: filter.to } : {}) };
+    const rows = await this.prisma.analyticsEvent.findMany({ where, orderBy: { createdAt: 'asc' }, take: filter?.limit ?? 100000 });
+    return rows.map((r: AnyRecord) => this.mapAnalytics(r));
+  }
+
+  async listConversationEventsForUsers(userIds: string[], from: Date, to: Date): Promise<ConversationEvent[]> {
+    if (!userIds.length) return [];
+    const rows = await this.prisma.conversationEvent.findMany({ where: { userId: { in: userIds }, createdAt: { gte: from, lte: to } }, orderBy: { createdAt: 'asc' } });
+    return rows.map((r: AnyRecord) => ({ id: r.id, userId: r.userId, type: r.type, payload: r.payload ?? null, createdAt: toDate(r.createdAt) }));
+  }
+
   // --- Admin ----------------------------------------------------------------
 
   private mapAdmin(a: AnyRecord): AdminUser {
@@ -863,6 +1216,8 @@ export class PrismaDatabase implements Database {
       type: m.type,
       dedupeKey: m.dedupeKey,
       payload: (m.payload ?? {}) as OutboxMessage['payload'],
+      campaignId: m.campaignId ?? null,
+      skippedReason: m.skippedReason ?? null,
       scheduledFor: toDate(m.scheduledFor),
       status: m.status,
       attempts: m.attempts,
@@ -874,7 +1229,7 @@ export class PrismaDatabase implements Database {
   }
 
   async enqueueOutbox(
-    msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt'>,
+    msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt' | 'campaignId' | 'skippedReason'> & { campaignId?: string | null; skippedReason?: string | null },
   ): Promise<OutboxMessage | null> {
     try {
       const m = await this.prisma.outboxMessage.create({
@@ -883,6 +1238,8 @@ export class PrismaDatabase implements Database {
           type: msg.type,
           dedupeKey: msg.dedupeKey,
           payload: msg.payload,
+          campaignId: msg.campaignId ?? null,
+          skippedReason: msg.skippedReason ?? null,
           scheduledFor: msg.scheduledFor,
         },
       });
@@ -921,13 +1278,15 @@ export class PrismaDatabase implements Database {
     return this.prisma.outboxMessage.count({ where: { userId, type, status: 'sent', sentAt: { gte: since } } });
   }
 
-  async listOutbox(filter?: { userId?: string; status?: string; limit?: number }): Promise<OutboxMessage[]> {
+  async listOutbox(filter?: { userId?: string; status?: string; campaignId?: string; limit?: number; offset?: number }): Promise<OutboxMessage[]> {
     const rows = await this.prisma.outboxMessage.findMany({
       where: {
         ...(filter?.userId ? { userId: filter.userId } : {}),
         ...(filter?.status ? { status: filter.status } : {}),
+        ...(filter?.campaignId ? { campaignId: filter.campaignId } : {}),
       },
       orderBy: { createdAt: 'desc' },
+      skip: filter?.offset ?? 0,
       take: filter?.limit ?? 100,
     });
     return rows.map((m: AnyRecord) => this.mapOutbox(m));

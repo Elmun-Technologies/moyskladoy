@@ -40,7 +40,7 @@ export async function routeUpdate(db: Database, engine: BotEngine, update: TgUpd
     return;
   }
   if (m.contact?.phone_number) {
-    await engine.handleText(meta, '', { phone: m.contact.phone_number });
+    await engine.handleText(meta, '', { phone: m.contact.phone_number, verified: m.contact.user_id === m.from.id });
     return;
   }
   if (m.text?.startsWith('/menu')) {

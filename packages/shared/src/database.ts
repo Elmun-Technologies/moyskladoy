@@ -2,6 +2,19 @@ import type {
   AdminUser,
   AnalyticsEvent,
   AuditLogEntry,
+  Campaign,
+  CampaignChannel,
+  CampaignDeliverySummary,
+  CampaignRecipient,
+  RetentionCohort,
+  SavedSegment,
+  SegmentFilters,
+  SmsMessage,
+  SmsMessageStatus,
+  StageFunnelPoint,
+  StageFunnelRow,
+  StageProgress,
+  UserPhone,
   Consent,
   ContentBlock,
   ConversationEvent,
@@ -68,6 +81,11 @@ export interface Database {
   getUserById(id: string): Promise<TelegramUser | null>;
   updateUser(id: string, patch: Partial<Pick<TelegramUser, 'blockedAt' | 'lastSeenAt' | 'siteLeadId' | 'username' | 'firstName' | 'lastName'>>): Promise<TelegramUser>;
   listUsers(filter?: { search?: string; stage?: string; limit?: number; offset?: number }): Promise<{ users: (TelegramUser & { state: ConversationState | null })[]; total: number }>;
+  upsertUserPhone(userId: string, phone: string, patch?: { verified?: boolean; smsConsent?: boolean }): Promise<UserPhone>;
+  getUserPhone(userId: string): Promise<UserPhone | null>;
+  getUserPhoneByPhone(phone: string): Promise<UserPhone | null>;
+  updateUserPhone(userId: string, patch: Partial<Pick<UserPhone, 'phone' | 'verified' | 'smsConsent'>>): Promise<UserPhone>;
+  countSmsSentToPhoneSince(phone: string, since: Date): Promise<number>;
 
   // --- Sayt murojaatlari va bog'lash tokenlari -----------------------------
   createSiteLead(input: CreateSiteLeadInput): Promise<SiteLead>;
@@ -88,6 +106,12 @@ export interface Database {
   updateState(userId: string, patch: Partial<ConversationState>): Promise<ConversationState>;
   appendEvent(userId: string, type: string, payload?: Record<string, unknown>): Promise<ConversationEvent>;
   listEvents(userId: string, limit?: number): Promise<ConversationEvent[]>;
+  upsertStageProgress(userId: string, stageKey: string, stepOrder: number, enteredAt?: Date): Promise<StageProgress>;
+  completeStageProgress(userId: string, stageKey: string, completedAt?: Date, reason?: StageProgress['exitReason']): Promise<StageProgress | null>;
+  listStageProgress(filter?: { userIds?: string[]; stageKey?: string; from?: Date; to?: Date; limit?: number }): Promise<StageProgress[]>;
+  getStageFunnel(from: Date, to: Date, stuckAfterDays?: number): Promise<StageFunnelRow[]>;
+  getStageFunnelSeries(from: Date, to: Date, by: 'day' | 'week'): Promise<StageFunnelPoint[]>;
+  getRetentionCohorts(from: Date, to: Date): Promise<RetentionCohort[]>;
 
   // --- Roziliklar -----------------------------------------------------------
   grantConsent(userId: string, type: Consent['type'], version: string): Promise<Consent>;
@@ -144,6 +168,24 @@ export interface Database {
   listHelpRequests(filter?: { status?: string }): Promise<HelpRequest[]>;
   updateHelpRequest(id: string, patch: Partial<HelpRequest>): Promise<HelpRequest>;
 
+  // --- Segmentlar / kampaniyalar / SMS -------------------------------------
+  previewSegment(filters: SegmentFilters, channel: CampaignChannel): Promise<{ count: number; sample: CampaignRecipient[] }>;
+  listSegmentRecipients(filters: SegmentFilters, channel: CampaignChannel, campaignId: string, limit?: number): Promise<CampaignRecipient[]>;
+  listSavedSegments(): Promise<SavedSegment[]>;
+  createSavedSegment(input: Omit<SavedSegment, 'id' | 'createdAt'>): Promise<SavedSegment>;
+  deleteSavedSegment(id: string): Promise<boolean>;
+  createCampaign(input: Omit<Campaign, 'id' | 'startsAt' | 'endsAt' | 'statsCache' | 'createdAt' | 'updatedAt'>): Promise<Campaign>;
+  getCampaign(id: string): Promise<Campaign | null>;
+  listCampaigns(limit?: number): Promise<Campaign[]>;
+  updateCampaign(id: string, patch: Partial<Campaign>): Promise<Campaign>;
+  getCampaignDeliverySummary(campaignId: string): Promise<CampaignDeliverySummary>;
+  createSmsMessage(input: Omit<SmsMessage, 'id' | 'attempts' | 'createdAt' | 'updatedAt'>): Promise<SmsMessage | null>;
+  getSmsMessage(id: string): Promise<SmsMessage | null>;
+  updateSmsMessage(id: string, patch: Partial<SmsMessage>): Promise<SmsMessage>;
+  listSmsMessages(filter?: { campaignId?: string; status?: SmsMessageStatus; limit?: number; offset?: number }): Promise<SmsMessage[]>;
+  listAnalyticsEvents(filter?: { types?: string[]; typePrefix?: string; campaignId?: string; userIds?: string[]; from?: Date; to?: Date; limit?: number }): Promise<AnalyticsEvent[]>;
+  listConversationEventsForUsers(userIds: string[], from: Date, to: Date): Promise<ConversationEvent[]>;
+
   // --- Admin ----------------------------------------------------------------
   getAdminByEmail(email: string): Promise<AdminUser | null>;
   getAdminById(id: string): Promise<AdminUser | null>;
@@ -152,14 +194,14 @@ export interface Database {
   listAdmins(): Promise<AdminUser[]>;
 
   // --- Outbox (navbatdagi xabarlar) -----------------------------------------
-  enqueueOutbox(msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt'>): Promise<OutboxMessage | null>;
+  enqueueOutbox(msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt' | 'campaignId' | 'skippedReason'> & { campaignId?: string | null; skippedReason?: string | null }): Promise<OutboxMessage | null>;
   /** null - dedupeKey takrorlangan (idempotent). */
   listDueOutbox(now: Date, limit?: number): Promise<OutboxMessage[]>;
   updateOutbox(id: string, patch: Partial<OutboxMessage>): Promise<OutboxMessage>;
   /** Rozilik bekor qilinganda / sotuv / blok - rejalashtirilgan xabarlarni to'xtatish. */
   cancelPendingOutboxForUser(userId: string, types?: OutboxMessage['type'][]): Promise<number>;
   countOutboxSentToUserSince(userId: string, type: OutboxMessage['type'], since: Date): Promise<number>;
-  listOutbox(filter?: { userId?: string; status?: string; limit?: number }): Promise<OutboxMessage[]>;
+  listOutbox(filter?: { userId?: string; status?: string; campaignId?: string; limit?: number; offset?: number }): Promise<OutboxMessage[]>;
 
   // --- Tahlil ---------------------------------------------------------------
   recordEvent(type: string, data: { userId?: string; siteLeadId?: string; dedupeKey?: string; properties?: Record<string, unknown> }): Promise<AnalyticsEvent | null>;

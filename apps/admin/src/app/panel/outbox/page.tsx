@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 
-interface O { id: string; userId: string; type: string; dedupeKey: string; status: string; attempts: number; scheduledFor: string; lastError: string | null }
+interface O { id: string; userId: string; type: string; dedupeKey: string; campaignId: string | null; status: string; attempts: number; scheduledFor: string; lastError: string | null; skippedReason: string | null }
 
 export default function Outbox() {
   const [items, setItems] = useState<O[]>([]);
@@ -20,16 +20,17 @@ export default function Outbox() {
       <h1>Xabarlar navbati (outbox)</h1>
       <p className="muted">Avto-yangilanadi (5s). &quot;failed&quot; - qayta urinishlar tugagan; &quot;cancelled&quot; - to&apos;xtatilgan.</p>
       <table>
-        <thead><tr><th>Holat</th><th>Turi</th><th>Dedupe</th><th>Reja</th><th>Urinish</th><th>Xato</th><th></th></tr></thead>
+        <thead><tr><th>Holat</th><th>Turi</th><th>Kampaniya</th><th>Dedupe</th><th>Reja</th><th>Urinish</th><th>Sabab / xato</th><th></th></tr></thead>
         <tbody>
           {items.map((o) => (
             <tr key={o.id}>
               <td><span className={'tag ' + (o.status === 'sent' ? 'ok' : o.status === 'failed' ? 'bad' : o.status === 'pending' ? 'warn' : '')}>{o.status}</span></td>
               <td>{o.type}</td>
+              <td>{o.campaignId ? o.campaignId.slice(0, 10) : '—'}</td>
               <td className="muted" style={{ fontSize: 11 }}>{o.dedupeKey}</td>
               <td>{new Date(o.scheduledFor).toLocaleString()}</td>
               <td>{o.attempts}</td>
-              <td className="err" style={{ fontSize: 11 }}>{o.lastError ?? ''}</td>
+              <td className="err" style={{ fontSize: 11 }}>{o.skippedReason ?? o.lastError ?? ''}</td>
               <td>{(o.status === 'pending') && <button onClick={() => cancel(o.id)}>bekor</button>}</td>
             </tr>
           ))}

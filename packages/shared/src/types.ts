@@ -67,7 +67,7 @@ export type ProductKind = 'course' | 'video_lessons' | 'service' | 'special_offe
 /** fixed - qat'iy narx; by_scope - ish haqiga qarab; unconfirmed - tasdiqlanmagan (foydalanuvchiga ko'rsatilmaz). */
 export type PriceType = 'fixed' | 'by_scope' | 'unconfirmed';
 
-export type ConsentType = 'marketing' | 'lessons';
+export type ConsentType = 'marketing' | 'lessons' | 'sms_marketing';
 
 export type AdminRole = 'admin' | 'sales' | 'content_editor';
 
@@ -314,6 +314,8 @@ export interface OutboxMessage {
 /** Qayta enqueue rad etilmaydi - unikal (idempotent) */
   dedupeKey: string;
   payload: Record<string, unknown>;
+  campaignId: string | null;
+  skippedReason: string | null;
   scheduledFor: Date;
   status: OutboxStatus;
   attempts: number;
@@ -321,6 +323,134 @@ export interface OutboxMessage {
   lastError: string | null;
   sentAt: Date | null;
   createdAt: Date;
+}
+
+export type CampaignChannel = 'telegram' | 'sms';
+export type CampaignStatus = 'draft' | 'scheduled' | 'running' | 'paused' | 'done' | 'cancelled';
+export type StageExitReason = 'completed' | 'dropped' | 'blocked';
+
+export interface StageProgress {
+  id: string;
+  userId: string;
+  stageKey: string;
+  stepOrder: number;
+  enteredAt: Date;
+  completedAt: Date | null;
+  exitReason: StageExitReason | null;
+}
+
+export interface SegmentDateRange {
+  from?: string | Date;
+  to?: string | Date;
+}
+
+/** Segment filtrlari AND bilan qo'llanadi; noma'lum kalitlar rad etiladi. */
+export interface SegmentFilters {
+  stageKey?: string;
+  stuckLongerThanDays?: number;
+  anyStageIn?: string[];
+  neverReached?: string[];
+  consentMarketing?: boolean;
+  hasPhone?: boolean;
+  smsConsent?: boolean;
+  lastActiveBetween?: SegmentDateRange;
+  createdBetween?: SegmentDateRange;
+  leadStatus?: string;
+  viewedProductIds?: string[];
+  blocked?: boolean;
+  languageCode?: string;
+}
+
+export interface UserPhone {
+  id: string;
+  userId: string;
+  phone: string;
+  verified: boolean;
+  smsConsent: boolean;
+  updatedAt: Date;
+}
+
+export interface Campaign {
+  id: string;
+  name: string;
+  channel: CampaignChannel;
+  segmentJson: SegmentFilters;
+  templateText: string;
+  buttonsJson: unknown[] | null;
+  mediaId: string | null;
+  status: CampaignStatus;
+  scheduledFor: Date | null;
+  /** SMS campaigns remain gated until an admin confirms the current estimate. */
+  smsConfirmedAt?: Date | null;
+  createdById: string;
+  startsAt: Date | null;
+  endsAt: Date | null;
+  statsCache: Record<string, unknown> | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type SmsMessageStatus = 'queued' | 'sending' | 'sent' | 'delivered' | 'failed' | 'cancelled';
+export interface SmsMessage {
+  id: string;
+  campaignId: string | null;
+  userId: string | null;
+  phone: string;
+  text: string;
+  status: SmsMessageStatus;
+  externalId: string | null;
+  lastError: string | null;
+  skippedReason: string | null;
+  attempts: number;
+  sentAt: Date | null;
+  reportedAt: Date | null;
+  isTest: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SavedSegment {
+  id: string;
+  name: string;
+  ownerId: string | null;
+  filtersJson: SegmentFilters;
+  createdAt: Date;
+}
+
+export interface CampaignRecipient {
+  user: TelegramUser;
+  state: ConversationState | null;
+  phone: UserPhone | null;
+}
+
+export interface StageFunnelRow {
+  stageKey: string;
+  stepOrder: number;
+  viewed: number;
+  completed: number;
+  stuck: number;
+  conversionPct: number;
+  medianMinutes: number | null;
+}
+
+export interface StageFunnelPoint extends StageFunnelRow {
+  bucket: string;
+}
+
+export interface RetentionCohort {
+  bucket: string;
+  users: number;
+  d1: number;
+  d7: number;
+  d30: number;
+}
+
+export interface CampaignDeliverySummary {
+  planned: number;
+  sent: number;
+  pending: number;
+  failed: number;
+  skipped: Record<string, number>;
 }
 
 export interface Media {
@@ -377,7 +507,20 @@ export type AnalyticsEventType =
   | 'consent_revoked'
   | 'bot_blocked'
   | 'notification_sent'
-  | 'nurture_tip_sent';
+  | 'nurture_tip_sent'
+  | 'stage_viewed'
+  | 'stage_completed'
+  | 'start_source'
+  | `button_click:${string}`
+  | 'link_opened'
+  | 'site_marketing_consent_granted'
+  | 'sms_consent_granted'
+  | 'sms_consent_revoked'
+  | 'campaign_sent'
+  | 'campaign_test_sent'
+  | 'campaign_click'
+  | 'campaign_reply'
+  | 'sms_report';
 
 /** Yuborish adapterining natijasi - "xabar yetgan-yetmagani" malumoti. */
 export interface SendResult {

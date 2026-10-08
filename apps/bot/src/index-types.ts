@@ -4,7 +4,7 @@ export interface TgUpdate {
     chat: { id: number };
     from?: { id: number; username?: string; first_name?: string; language_code?: string };
     text?: string;
-    contact?: { phone_number?: string };
+    contact?: { phone_number?: string; user_id?: number };
   };
   callback_query?: {
     id: string;

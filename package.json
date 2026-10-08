@@ -17,6 +17,7 @@
     "dev:worker": "npm run dev -w apps/worker",
     "dev:admin": "npm run dev -w apps/admin",
     "db:generate": "npm run db:generate -w packages/db",
+    "db:push": "npm run db:push -w packages/db",
     "db:migrate": "npm run db:migrate -w packages/db",
     "db:seed": "npm run db:seed -w packages/db",
     "compose:up": "docker compose up -d --build",
