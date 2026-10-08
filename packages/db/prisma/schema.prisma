@@ -1,0 +1,359 @@
+// ============================================================================
+// Moy Sklad bot platformasi - ma'lumotlar bazasi sxemasi
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model TelegramUser {
+  id           String    @id @default(cuid())
+  telegramId   BigInt    @unique
+  username     String?
+  firstName    String?
+  lastName     String?
+  languageCode String?
+  blockedAt    DateTime?
+  lastSeenAt   DateTime?
+  siteLeadId   String?
+  siteLead     SiteLead? @relation(fields: [siteLeadId], references: [id])
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  state         ConversationState?
+  consents      Consent[]
+  events        ConversationEvent[]
+  productViews  LeadProductView[]
+  salesLeads    SalesLead[]
+  helpRequests  HelpRequest[]
+  outbox        OutboxMessage[]
+  linkToken     LinkToken?
+
+  @@index([blockedAt])
+  @@index([lastSeenAt])
+}
+
+model SiteLead {
+  id               String   @id @default(cuid())
+  name             String
+  phone            String
+  utmSource        String?
+  utmMedium        String?
+  utmCampaign      String?
+  consentContact   Boolean  @default(false)
+  consentMarketing Boolean  @default(false)
+  consentVersion   String   @default("v1")
+  ipHash           String?
+  createdAt        DateTime @default(now())
+
+  users           TelegramUser[]
+  linkTokens      LinkToken[]
+  analyticsEvents AnalyticsEvent[]
+
+  @@index([createdAt])
+  @@index([utmSource, utmCampaign])
+}
+
+model LinkToken {
+  id             String       @id @default(cuid())
+  token          String       @unique
+  siteLeadId     String
+  siteLead       SiteLead     @relation(fields: [siteLeadId], references: [id])
+  telegramUserId String?      @unique
+  telegramUser   TelegramUser? @relation(fields: [telegramUserId], references: [id])
+  expiresAt      DateTime
+  usedAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([expiresAt])
+}
+
+model Consent {
+  id        String    @id @default(cuid())
+  userId    String
+  user      TelegramUser @relation(fields: [userId], references: [id])
+  type      String // marketing | lessons
+  version   String
+  grantedAt DateTime  @default(now())
+  revokedAt DateTime?
+
+  @@index([userId, type, revokedAt])
+}
+
+model ConversationState {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  user                  TelegramUser @relation(fields: [userId], references: [id])
+  stage                 String   @default("START")
+  answers               Json     @default("{}")
+  interestedProductId   String?
+  interestedProduct     Product? @relation("StateProduct", fields: [interestedProductId], references: [id])
+  lessonLinkClickedAt   DateTime?
+  lessonWatchedAt       DateTime?
+  taskAnswer            String?
+  contactMethod         String?
+  preferredTime         String?
+  contactConsentGivenAt DateTime?
+  salesStatus           String   @default("none") // none | learning | not_ready | in_sales | purchased | not_fit | no_contact
+  humanHandling         Boolean  @default(false)
+  lastReminderAt        DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([stage])
+  @@index([salesStatus])
+  @@index([updatedAt])
+}
+
+model ConversationEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      TelegramUser @relation(fields: [userId], references: [id])
+  type      String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+model Product {
+  id                String   @id @default(cuid())
+  slug              String   @unique
+  name              String
+  kind              String // course | video_lessons | service | special_offer
+  description       String   @default("")
+  details           Json     @default("{}")
+  priceType         String   @default("fixed") // fixed | by_scope | unconfirmed
+  priceUsd          Decimal? @db.Decimal(10, 2)
+  currency          String   @default("USD")
+  isActive          Boolean  @default(true)
+  visibleToUsers    Boolean  @default(true)
+  currentVersionId  String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  versions       ProductVersion[]
+  views          LeadProductView[]
+  leads          SalesLead[]
+  stateLinks     ConversationState[] @relation("StateProduct")
+
+  @@index([visibleToUsers, isActive])
+}
+
+model ProductVersion {
+  id          String   @id @default(cuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  version     Int
+  name        String
+  description String   @default("")
+  details     Json     @default("{}")
+  priceType   String
+  priceUsd    Decimal? @db.Decimal(10, 2)
+  createdAt   DateTime @default(now())
+
+  views LeadProductView[]
+  leads SalesLead[]
+
+  @@unique([productId, version])
+  @@index([productId])
+}
+
+model LeadProductView {
+  id               String   @id @default(cuid())
+  userId           String
+  user             TelegramUser @relation(fields: [userId], references: [id])
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id])
+  productVersionId String
+  productVersion   ProductVersion @relation(fields: [productVersionId], references: [id])
+  viewedAt         DateTime @default(now())
+
+  @@index([userId])
+  @@index([productId])
+}
+
+model ContentBlock {
+  id                  String   @id @default(cuid())
+  key                 String
+  version             Int
+  stage               String?
+  title               String   @default("")
+  body                String   @default("")
+  mediaType           String?
+  mediaId             String?
+  mediaSourceUrl      String?
+  buttons             Json     @default("[]")
+  videoScript       String?
+  showCondition       Json?
+  status              String   @default("draft") // draft | approved
+  textFallbackAllowed Boolean  @default(true)
+  requiresMedia       Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([key, version])
+  @@index([stage, status])
+  @@index([status])
+}
+
+model Media {
+  id            String   @id @default(cuid())
+  fileId        String?
+  sourceUrl     String?
+  originalName  String?
+  mimeType      String?
+  sizeBytes     Int?
+  durationSec   Int?
+  isVideoNote   Boolean  @default(false)
+  status        String   @default("uploaded") // uploaded | processing | approved | rejected
+  formatChecked Boolean  @default(false)
+  uploadedById  String?
+  uploadedBy    AdminUser? @relation(fields: [uploadedById], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@index([status])
+}
+
+model SalesLead {
+  id               String   @id @default(cuid())
+  userId           String
+  user             TelegramUser @relation(fields: [userId], references: [id])
+  siteLeadId       String?
+  productId        String?
+  product          Product? @relation(fields: [productId], references: [id])
+  productVersionId String?
+  productVersion   ProductVersion? @relation(fields: [productVersionId], references: [id])
+  task             String?
+  problem          String?
+  businessType     String?
+  decisionMaker    String?
+  timeline         String?
+  contactMethod    String?
+  preferredTime    String?
+  contactConsent   Boolean  @default(false)
+  openQuestion     String?
+  status           String   @default("new") // new | assigned | contacting | talked | later | purchased | not_fit | no_contact
+  assignedToId     String?
+  assignedTo       AdminUser? @relation(fields: [assignedToId], references: [id])
+  claimedAt        DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  events SalesEvent[]
+
+  @@index([status])
+  @@index([assignedToId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model SalesEvent {
+  id        String   @id @default(cuid())
+  leadId    String
+  lead      SalesLead @relation(fields: [leadId], references: [id])
+  type      String // created | notified | notify_failed | claimed | status_changed | note | purchase_confirmed
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+}
+
+model HelpRequest {
+  id           String   @id @default(cuid())
+  userId       String
+  user         TelegramUser @relation(fields: [userId], references: [id])
+  question     String
+  status       String   @default("open") // open | answered | closed
+  answer       String?
+  answeredById String?
+  answeredBy   AdminUser? @relation(fields: [answeredById], references: [id])
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status])
+}
+
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         String // admin | sales | content_editor
+  failedLogins Int       @default(0)
+  lockedUntil  DateTime?
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+
+  leads        SalesLead[]
+  media        Media[]
+  helpAnswers  HelpRequest[]
+
+  @@index([role])
+}
+
+model OutboxMessage {
+  id           String   @id @default(cuid())
+  userId       String
+  user         TelegramUser @relation(fields: [userId], references: [id])
+  type         String // reminder | marketing | notification
+  dedupeKey    String   @unique
+  payload      Json
+  scheduledFor DateTime
+  status       String   @default("pending") // pending | sending | sent | failed | cancelled
+  attempts     Int      @default(0)
+  nextAttemptAt DateTime?
+  lastError    String?
+  sentAt       DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([status, scheduledFor])
+  @@index([userId])
+}
+
+model ProcessedUpdate {
+  updateId  BigInt   @id
+  createdAt DateTime @default(now())
+}
+
+model AnalyticsEvent {
+  id         String    @id @default(cuid())
+  type       String
+  userId     String?
+  siteLeadId String?
+  siteLead   SiteLead? @relation(fields: [siteLeadId], references: [id])
+  dedupeKey  String?   @unique
+  properties Json?
+  createdAt  DateTime  @default(now())
+
+  @@index([type, createdAt])
+  @@index([userId])
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([entity])
+  @@index([actorId])
+  @@index([createdAt])
+}

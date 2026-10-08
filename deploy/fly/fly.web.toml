@@ -1,0 +1,68 @@
+# ============================================================================
+# Fly.io - asosiy app: API (sayt formasi + admin API) + bot + worker.
+# Bitta image, uchta process group. Redis SHART EMAS: REDIS_URL bo'lmasa
+# worker in-process interval rejimida ishlaydi (bir machina uchun yetarli).
+#
+# Bir marta:
+#   fly apps create moyskladoy
+#   fly postgres create --name moyskladoy-db --vm-size shared-cpu-1x --initial-cluster-size 1 --volume-size 5
+#   fly postgres attach moyskladoy-db --app moyskladoy
+#   fly secrets set TELEGRAM_BOT_TOKEN=... BOT_USERNAME=... SESSION_SECRET=... IP_HASH_SALT=... \
+#       ADMIN_EMAIL=... ADMIN_PASSWORD=... SALES_GROUP_CHAT_ID=... SALES_STAFF_TELEGRAM_IDS=... --app moyskladoy
+#   fly volume create moyskladoy_data --app moyskladoy
+# Deploy:
+#   fly deploy --config deploy/fly/fly.web.toml
+# Migratsiya + seed (deploy'dan keyin):
+#   fly ssh console -C "npm run db:migrate:deploy -w @app/db"
+#   fly ssh console -C "npm run db:seed -w @app/db"
+# ============================================================================
+app = "moyskladoy"
+primary_region = "cdg" # Talindagi regionni tanlang: fly platforms info
+
+[build]
+dockerfile = "../../Dockerfile"
+
+[env]
+NODE_ENV = "production"
+API_PORT = "4000"
+API_HOST = "0.0.0.0"
+# Fly'da eng oson yo'l: bot long-polling (webhook/domain sozlash shart emas).
+# Webhook xohlasangiz: BOT_MODE=webhook va /telegram/webhook ni bot:4100'ga
+# proksi qiling (docs/DEPLOYMENT.md 5-band).
+BOT_MODE = "polling"
+LINK_TOKEN_TTL_HOURS = "24"
+FORM_RATE_LIMIT_MAX = "5"
+FORM_MIN_FILL_MS = "1500"
+
+[processes]
+app = "npm run start -w @app/api"
+bot = "npm run start -w @app/bot"
+worker = "npm run start -w @app/worker"
+
+[http_service]
+internal_port = 4000
+force_https = true
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 1
+processes = ["app"]
+
+[http_service.concurrency]
+type = "requests"
+soft_limit = 200
+hard_limit = 1000
+
+[[http_service.checks]]
+method = "GET"
+path = "/healthz"
+interval = "30s"
+timeout = "5s"
+grace_period = "30s"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"
+
+[mounts]
+source = "moyskladoy_data"
+destination = "/data"

@@ -1,0 +1,30 @@
+:root { --bg:#f6f7f9; --card:#fff; --line:#e3e6ea; --txt:#17202a; --mut:#6b7683; --acc:#0b5fff; --warn:#b7791f; --bad:#c0392b; --ok:#1e8e5a; }
+* { box-sizing:border-box }
+body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt) }
+a { color:var(--acc); text-decoration:none }
+.wrap { display:flex; min-height:100vh }
+.nav { width:210px; background:#101828; color:#fff; padding:16px 0; flex-shrink:0 }
+.nav a { display:block; color:#cbd5e1; padding:9px 18px; font-size:14px }
+.nav a:hover, .nav a.on { background:#1c2942; color:#fff }
+.nav .brand { font-weight:700; padding:6px 18px 14px; color:#fff; font-size:16px }
+.main { flex:1; padding:20px 26px; max-width:1200px }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px }
+table { width:100%; border-collapse:collapse; font-size:13px }
+th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top }
+th { color:var(--mut); font-weight:600 }
+button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 12px; cursor:pointer }
+button.pri { background:var(--acc); border-color:var(--acc); color:#fff }
+input, textarea, select { font:inherit; border:1px solid var(--line); border-radius:8px; padding:6px 9px; width:100%; background:#fff }
+label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:10px }
+.kpi { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px }
+.kpi b { font-size:22px; display:block }
+.tag { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; border:1px solid var(--line) }
+.tag.ok { color:var(--ok); border-color:var(--ok) }
+.tag.warn { color:var(--warn); border-color:var(--warn) }
+.tag.bad { color:var(--bad); border-color:var(--bad) }
+.muted { color:var(--mut) }
+h1 { font-size:19px; margin:0 0 14px }
+h2 { font-size:15px; margin:14px 0 8px }
+.err { color:var(--bad) }

@@ -1,0 +1,25 @@
+{
+  "name": "@app/admin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p ${ADMIN_PORT:-3000}",
+    "build": "next build",
+    "start": "next start -p ${ADMIN_PORT:-3000}",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"e2e: npx playwright test (browserlar kerak)\" && exit 0"
+  },
+  "dependencies": {
+    "next": "15.5.27",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "@app/shared": "*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.5",
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "@playwright/test": "1.64.0"
+  }
+}

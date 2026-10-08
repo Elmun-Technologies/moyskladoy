@@ -1,0 +1,33 @@
+{
+  "name": "@app/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@app/shared": "*",
+    "@app/db": "*",
+    "@app/bot": "*",
+    "fastify": "5.12.5",
+    "@fastify/rate-limit": "11.2.0",
+    "@fastify/cors": "11.3.0",
+    "@fastify/helmet": "13.1.1",
+    "@fastify/cookie": "11.1.2",
+    "zod": "3.25.76",
+    "bcryptjs": "3.0.3",
+    "grammy": "1.46.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.5",
+    "@types/bcryptjs": "3.0.0",
+    "tsx": "4.23.15",
+    "vitest": "3.2.7"
+  }
+}
