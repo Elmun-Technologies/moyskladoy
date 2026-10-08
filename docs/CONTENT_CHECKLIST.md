@@ -18,10 +18,18 @@
 
 1. Videoni tayyorlang (videoproduser Jamshid; biz avtomatik yuklab olmaymiz -
    Instagram'dan ruxsatsiz yuklash taqiqlangan).
-2. Vaqtincha chatga yuborib `file_id` oling yoki `sendVideoNote` API bilan:
-   `curl -F chat_id=<admin_chat> -F video_note=@intro.mp4 https://api.telegram.org/bot$TOKEN/sendVideoNote`
-   (javobdagi `file_id`ni nusxalang - u doimiy).
-3. Panel: Media bo'limiga `file_id`ni qo'shing, keyin blokka bog'lang va tasdiqlang.
+2. **Panel orqali (tavsiya):** Media bo'limida faylni tanlang - API uni
+   Telegram'ga yuborib `file_id`ni avtomatik oladi (TELEGRAM_BOT_TOKEN va
+   target chat_id sozlangan bo'lsa). Token bo'lmasa fayl serverda saqlanadi va
+   keyin bog'lanadi.
+3. Yoki terminal orqali: `curl -F chat_id=<admin_chat> -F video_note=@intro.mp4
+   https://api.telegram.org/bot$TOKEN/sendVideoNote` - javobdagi `file_id`ni
+   Media katalogiga qo'shing.
+4. Kontent bo'limida: blokni oching -> Media turi = "Dumaloq video" -> katalogdan
+   tanlang (yoki file_id kiriting) -> Saqlash (qoralama) -> Tasdiqlash.
+5. Shu yerda tugmalarni ham boshqariladi: qo'shish, o'chirish, tartib, yoqish/
+   off. Noto'g'ri yoki mavjud bo'lmagan sahnaenga yo'naltirilgan tugma server
+   tomonida rad etiladi (422) - bot hech qachon singan tugma yubormaydi.
 
 Sinov darsi havolasi: Sozlamalar -> "Sinov darsi havolasi" (bo'sh bo'lsa bot
 "Darsni ochish" tugmasini ko'rsatmaydi - dars berilmaydi, halokat bo'lmaydi).
