@@ -4,6 +4,7 @@ import type { Database } from '@app/shared';
 import { applySeed } from '@app/db';
 import { OutboxSender, nextWindowStart } from '../src/sender.js';
 import { scheduleRules } from '../src/reminders.js';
+import { createTickDriver } from '../src/queue.js';
 
 let db: Database;
 let msg: TestMessenger;
@@ -146,6 +147,24 @@ describe('followup qoshimcha kafolatlari', () => {
     msg.clear();
     const r = await sender.processDue(IN_WINDOW);
     expect(r.sent).toBe(1);
+  });
+
+  it('serializes slow in-process ticks to prevent overlapping campaign sends', async () => {
+    const driver = await createTickDriver({ redisUrl: null, intervalMs: 5 });
+    let active = 0;
+    let maxActive = 0;
+    let ticks = 0;
+    await driver.start(async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      ticks++;
+      active--;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    await driver.stop();
+    expect(maxActive).toBe(1);
+    expect(ticks).toBeGreaterThan(1);
   });
 
   it('zaqor (poison) xabar cheksiz aylanmaydi - attempts yetganda failed', async () => {

@@ -33,6 +33,9 @@ model TelegramUser {
   helpRequests  HelpRequest[]
   outbox        OutboxMessage[]
   linkToken     LinkToken?
+  stageProgress StageProgress[]
+  phone         UserPhone?
+  smsMessages   SmsMessage[]
 
   @@index([blockedAt])
   @@index([lastSeenAt])
@@ -216,6 +219,7 @@ model Media {
   formatChecked Boolean  @default(false)
   uploadedById  String?
   uploadedBy    AdminUser? @relation(fields: [uploadedById], references: [id])
+  campaigns     Campaign[]
   createdAt     DateTime @default(now())
 
   @@index([status])
@@ -294,6 +298,8 @@ model AdminUser {
   leads        SalesLead[]
   media        Media[]
   helpAnswers  HelpRequest[]
+  campaigns    Campaign[] @relation("CampaignCreator")
+  savedSegments SavedSegment[]
 
   @@index([role])
 }
@@ -305,6 +311,9 @@ model OutboxMessage {
   type         String // reminder | marketing | notification
   dedupeKey    String   @unique
   payload      Json
+  campaignId   String?
+  campaign     Campaign? @relation(fields: [campaignId], references: [id])
+  skippedReason String?
   scheduledFor DateTime
   status       String   @default("pending") // pending | sending | sent | failed | cancelled
   attempts     Int      @default(0)
@@ -315,6 +324,98 @@ model OutboxMessage {
 
   @@index([status, scheduledFor])
   @@index([userId])
+  @@index([campaignId])
+}
+
+// Etap tarixi - mavjud ConversationState'ni almashtirmaydi, faqat o'lchov qatlami.
+model StageProgress {
+  id          String       @id @default(cuid())
+  userId      String
+  user        TelegramUser @relation(fields: [userId], references: [id])
+  stageKey    String
+  stepOrder   Int
+  enteredAt   DateTime     @default(now())
+  completedAt DateTime?
+  exitReason  String? // completed | dropped | blocked
+
+  @@unique([userId, stageKey])
+  @@index([stageKey, completedAt])
+  @@index([enteredAt, stageKey])
+}
+
+// Bir kampaniya - Telegram yoki SMS; model faqat additive, mavjud yozuvlar o'zgarmaydi.
+model Campaign {
+  id           String       @id @default(cuid())
+  name         String
+  channel      String       // telegram | sms
+  segmentJson  Json
+  templateText String
+  buttonsJson  Json?
+  mediaId      String?
+  media        Media?       @relation(fields: [mediaId], references: [id])
+  status       String       @default("draft") // draft | scheduled | running | paused | done | cancelled
+  scheduledFor DateTime?
+  smsConfirmedAt DateTime?
+  createdById  String
+  createdBy    AdminUser    @relation("CampaignCreator", fields: [createdById], references: [id])
+  startsAt     DateTime?
+  endsAt       DateTime?
+  statsCache   Json?
+  outbox       OutboxMessage[]
+  smsMessages  SmsMessage[]
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([status, scheduledFor])
+  @@index([createdById])
+}
+
+model SmsMessage {
+  id            String       @id @default(cuid())
+  campaignId    String?
+  campaign      Campaign?    @relation(fields: [campaignId], references: [id])
+  userId        String?
+  user          TelegramUser? @relation(fields: [userId], references: [id])
+  phone         String
+  text          String
+  status        String       @default("queued") // queued | sending | sent | delivered | failed | cancelled
+  externalId    String?
+  lastError     String?
+  skippedReason String?
+  attempts      Int          @default(0)
+  sentAt        DateTime?
+  reportedAt    DateTime?
+  isTest        Boolean      @default(false)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([status])
+  @@index([campaignId])
+  @@index([phone, sentAt])
+  @@unique([campaignId, userId])
+}
+
+model UserPhone {
+  id         String       @id @default(cuid())
+  userId     String       @unique
+  user       TelegramUser @relation(fields: [userId], references: [id])
+  phone      String       @unique
+  verified   Boolean      @default(false)
+  smsConsent Boolean      @default(false)
+  updatedAt  DateTime     @updatedAt
+
+  @@index([smsConsent])
+}
+
+model SavedSegment {
+  id          String    @id @default(cuid())
+  name        String
+  ownerId     String?
+  owner       AdminUser? @relation(fields: [ownerId], references: [id])
+  filtersJson Json
+  createdAt   DateTime  @default(now())
+
+  @@index([ownerId, createdAt])
 }
 
 model ProcessedUpdate {

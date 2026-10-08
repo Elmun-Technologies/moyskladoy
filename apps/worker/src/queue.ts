@@ -39,10 +39,17 @@ export async function createTickDriver(opts: QueueOptions): Promise<TickDriver> 
     };
   }
   let timer: NodeJS.Timeout | null = null;
+  let tickRunning = false;
   return {
     async start(onTick) {
       timer = setInterval(() => {
-        void onTick().catch((e) => opts.log?.('[queue] tick error: ' + String((e as Error).message).slice(0, 160)));
+        // setInterval does not await async callbacks; serialize work so a slow
+        // tick cannot double-dispatch the same SMS window/campaign rows.
+        if (tickRunning) return;
+        tickRunning = true;
+        void onTick()
+          .catch((e) => opts.log?.('[queue] tick error: ' + String((e as Error).message).slice(0, 160)))
+          .finally(() => { tickRunning = false; });
       }, opts.intervalMs);
       opts.log?.('[queue] interval driver (redis yo\'q)');
     },

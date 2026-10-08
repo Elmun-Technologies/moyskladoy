@@ -11,16 +11,18 @@
 #       ADMIN_EMAIL=... ADMIN_PASSWORD=... SALES_GROUP_CHAT_ID=... SALES_STAFF_TELEGRAM_IDS=... --app moyskladoy
 #   fly volume create moyskladoy_data --app moyskladoy
 # Deploy:
-#   fly deploy --config deploy/fly/fly.web.toml
-# Migratsiya + seed (deploy'dan keyin):
-#   fly ssh console -C "npm run db:migrate:deploy -w @app/db"
-#   fly ssh console -C "npm run db:seed -w @app/db"
+# fly deploy --config fly.toml
+# Har deploy release_command'da additive schema'ni npx prisma db push bilan yangilaydi.
+# Admin seed (birinchi deploy): fly ssh console -C "npm run db:seed -w @app/db"
 # ============================================================================
 app = "moyskladoy"
 primary_region = "cdg" # Talindagi regionni tanlang: fly platforms info
 
 [build]
-dockerfile = "../../Dockerfile"
+dockerfile = "Dockerfile"
+
+[deploy]
+release_command = "npx prisma db push --schema packages/db/prisma/schema.prisma"
 
 [env]
 NODE_ENV = "production"

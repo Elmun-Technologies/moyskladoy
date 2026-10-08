@@ -1,103 +1,116 @@
 # Deploy / rollback / backup
 
-## Birinchi deploy (VPS yoki PaaS, Docker Compose)
+## Schema safety
 
-1. `git clone` va release tagga o'tish: `git checkout v<versiya>`.
-2. `.env` faylni to'ldiring (barcha kalitlar `.env.example`da).
-   Kamida: `TELEGRAM_BOT_TOKEN`, `BOT_USERNAME`, `PUBLIC_URL`, `SESSION_SECRET`
-   (32+ tasodifiy belgi), `IP_HASH_SALT`, `TELEGRAM_WEBHOOK_SECRET`,
-   `ADMIN_EMAIL/ADMIN_PASSWORD`, `SALES_STAFF_TELEGRAM_IDS`.
-3. `npm run compose:up` - postgres, redis, api, bot, worker, admin qadaladi.
-4. Migratsiyalar va seed:
-   `docker compose exec api npm run db:migrate:deploy -w @app/db`
-   `docker compose exec api npm run db:seed -w @app/db`
-   (seed ichida ADMIN_EMAIL/PASSWORD bo'lsa admin yaratadi).
-5. Webhook: `BOT_MODE=webhook` bo'lsa Telegram'ga:
-   `curl -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://<domain>/telegram/webhook","secret_token":"<TELEGRAM_WEBHOOK_SECRET>"}'`
-   Va reverse-proxy'da `/telegram/webhook` ni `apps/bot:4100` ga yo'naltiring.
-   (Polling rejimida buning hojati yo'q.)
-6. Sayt formasidan `fetch('https://<domain>/api/site/lead', ...)` chaqiriladi;
-   `CORS_ORIGINS`ga sayt domeni qo'shiladi.
+Prisma o'zgarishlari faqat **additive**: mavjud model/ustun o'chirilmaydi yoki qayta nomlanmaydi. Fly asosiy app release bosqichida `npx prisma db push --schema packages/db/prisma/schema.prisma` ishga tushadi; alohida `migrate deploy` ishlatilmaydi. `db push` release muvaffaqiyatsiz bo'lsa, yangi app versiyasi ishga tushmaydi. Rollback'da yangi ustun/jadvallar bazada qoladi — eski app versiyasi bilan moslik shu sabab saqlanadi. Har qanday deploydan oldin Postgres backup oling.
 
-## Rollback
+Lokal schema yangilash:
 
-- `git checkout <oldingi-tag> && npm run compose:up` (compose rebuild qiladi).
-- Migratsiyalar oldinga qaytariladi (`prisma migrate deploy`) - schema
-  backward-compatible saqlanadi; buzuvchi migratsiyadan oldin albatta
-  `pg_dump` oling va migratsiyani alohida `down` skript bilan hujjatlang.
+```bash
+npm run db:push
+npm run db:seed # faqat birinchi o'rnatishda yoki seed ma'lumotini ataylab yangilaganda
+```
 
-## Backup
+## Docker Compose
 
-- Postgres: `docker compose exec postgres pg_dump -U postgres moyskladoy | gzip > backup-$(date +%F).sql.gz`
-  (cron: kuniga 1 marta; offline joyga ko'chiring).
-- Tiklash: `gunzip -c backup.sql | docker compose exec -T postgres psql -U postgres moyskladoy`.
-- Media fayllar Telegram CDN'da (file_id); bizda katalog yozuvlari - DB backup yetarli.
-- Redis - faqat navbat tezligi; o'chsa outbox DB'dan tiklanadi (zarar yo'q).
+1. `.env.example`dan `.env` yarating va qiymatlarni serverda to'ldiring. Kamida: `TELEGRAM_BOT_TOKEN`, `BOT_USERNAME`, `SESSION_SECRET` (32+ tasodifiy belgi), `IP_HASH_SALT`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SALES_GROUP_CHAT_ID`, `SALES_STAFF_TELEGRAM_IDS`.
+2. `npm run compose:up` — Postgres, Redis (ixtiyoriy), API, bot, worker va admin panelni ishga tushiradi.
+3. Birinchi deployda: `docker compose exec api npx prisma db push --schema packages/db/prisma/schema.prisma`, keyin `docker compose exec api npm run db:seed -w @app/db`.
+4. SMS ixtiyoriy: `SMS_USER` va `SMS_PASSWORD` bo'sh bo'lsa yuborish o'chiriladi, queued SMS qaydlari saqlanadi. Ishga tushirish uchun Eskiz hisob ma'lumotlarini worker/API jarayonlari ko'radigan server secret/env'ga kiriting. Hech qachon qiymatlarni repoga qo'shmang. `SMS_FROM` va `SMS_PRICE_PER_PART_UZS` ham sozlanishi mumkin; ikkinchisi faqat estimate, hisobingizning provayder kotirovkasi emas.
+5. Bot `BOT_MODE=polling` bilan ishlasa webhook kerak emas. Webhook rejimida Telegram `setWebhook` va reverse-proxy kerak bo'ladi.
 
-## Kuzatish
+## Fly.io (asosiy app + admin panel)
 
-- Har xizmatda `GET /healthz`. Docker healthcheck yoki uptime monitor qo'shing.
-- Loglar sanitizatsiyalangan (telefonlar maskPhone bilan) - baribir log fayllarini
-  cheklangan saqlash muddati bilan saqlang.
+`fly.toml` bitta `moyskladoy` image'ida API, bot (grammY long polling) va worker'ni alohida process group qiladi. `fly.admin.toml` — alohida Next.js admin app. Repo ildizidan deploy qiling:
 
-
-## Fly.io deploy (bizning server)
-
-Tayyor konfiguratsiyalar: `Dockerfile` (root) + `deploy/fly/fly.web.toml` +
-`deploy/fly/fly.admin.toml`. Kerakli: `flyctl` o'rnatilgan va `fly auth login`.
-
-1. **Asosiy app** (api+bot+worker, bitta image, 3 process group):
+1. Birinchi o'rnatishda Fly app/Postgres/volume yarating va **o'zingiz** secrets sozlang:
 
    ```bash
    fly apps create moyskladoy
-   fly postgres create --name moyskladoy-db --vm-size shared-cpu-1x \
-     --initial-cluster-size 1 --volume-size 5
-   fly postgres attach moyskladoy-db --app moyskladoy   # DATABASE_URL auto
-   fly volume create moyskladoy_data --app moyskladoy   # MEDIA_DIR uchun
+   fly postgres create --name moyskladoy-db --vm-size shared-cpu-1x --initial-cluster-size 1 --volume-size 5
+   fly postgres attach moyskladoy-db --app moyskladoy
+   fly volume create moyskladoy_data --app moyskladoy
    fly secrets set TELEGRAM_BOT_TOKEN=... BOT_USERNAME=... \
      SESSION_SECRET="$(openssl rand -hex 32)" IP_HASH_SALT="$(openssl rand -hex 32)" \
      ADMIN_EMAIL=... ADMIN_PASSWORD=... SALES_GROUP_CHAT_ID=... \
-     SALES_STAFF_TELEGRAM_IDS=... CORS_ORIGINS=https://<sayt-domene> --app moyskladoy
-   fly deploy --config deploy/fly/fly.web.toml
-   fly ssh console -C "npm run db:migrate:deploy -w @app/db"
-   fly ssh console -C "npm run db:seed -w @app/db"
+     SALES_STAFF_TELEGRAM_IDS=... --app moyskladoy
    ```
 
-2. **Admin panel** (alohida app, ichki tarmoq orqali API'ga ulanadi):
+   SMS ixtiyoriy secrets (faqat Eskiz hisobingiz bo'lsa):
 
    ```bash
-   fly apps create moyskladoy-admin
-   fly deploy --config deploy/fly/fly.admin.toml
+   fly secrets set SMS_USER='<Eskiz login>' SMS_PASSWORD='<Eskiz parol>' --app moyskladoy
+   # Istasangiz yuboruvchi nomi va estimate narxini alohida sozlang:
+   fly secrets set SMS_FROM='4546' SMS_PRICE_PER_PART_UZS='95' --app moyskladoy
    ```
 
-3. **Bot rejimi:** toml'da `BOT_MODE=polling` - webhook, sertifikat, domain
-   sozlash shart emas (bot o'zi Telegram'dan yangi oladi). Webhook kerak
-   bo'lsa: `BOT_MODE=webhook` secret bilan + docs yuqoridagi 5-band.
+   `SMS_USER`/`SMS_PASSWORD` sozlanmaganida API balans javobida aynan shu env nomlarini ko'rsatadi; worker SMS xabarlarini yo'qotmay navbatda qoldiradi. `SMS_PRICE_PER_PART_UZS=95` — o'zgartiriladigan estimate qiymati, Eskiz hisobingiz narxining tasdig'i emas.
 
-4. **Redis kerak emas:** `REDIS_URL` bo'lmasa worker in-process interval
-   navbatda ishlaydi (bir machina uchun to'liq yetarli; reminder-lar
-   DB outbox'da, u qismidan holat saqlanadi). Keyinchalik parallel
-   bot/worker instance kerak bo'lsa - Upstash Redis qo'shib `REDIS_URL`
-   secret'ini bering.
+2. Asosiy app'ni deploy qiling. `fly.toml`dagi release command DB schema'ni avtomatik va additive tarzda qo'llaydi:
 
-5. **Demo sahifa** (`GET /` api'da) `https://moyskladoy.fly.dev` da ochiladi -
-   sayt formasi + bot simulyatori. Haqiqiy sayt formasini boshqa domendan
-   chaqirsangiz, o'sha domenni `CORS_ORIGINS`ga qo'shing.
+   ```bash
+   fly deploy --config fly.toml
+   ```
 
-6. **Yangilash:** `git push` -> `fly deploy --config ...` (ikkala app uchun
-   alohida). Rollback: `fly releases rollback` yoki eski commitga
-   `git checkout` + qayta deploy (migratsiyalar backward-compatible).
+   Birinchi ishga tushirishda admin/seed ma'lumoti kerak bo'lsa:
 
-7. **Cheklovlar:** `auto_stop_machines="stop"` bo'lsa idle'da bot/worker
-   to'xtamaydi (faqat app group processes'da) - reminderlar uzluksiz ishlashi
-   uchun web group ham `min_machines_running=1` qilingan. Full-time ish
-   hajmi uchun hisobni kuzating; kerak bo'lsa `fly scale memory 512`.
+   ```bash
+   fly ssh console --app moyskladoy -C "npm run db:seed -w @app/db"
+   ```
 
-Eslatma: Fly'dagi birinchi deploy'da Docker build remote builder'da ketadi
-(~3-5 daqiqa). Bu sandbox'da docker/build qatlam sinovdan o'tkazilmagan -
-birinchi `fly deploy`'ni kuzatib chiqing.
+3. Admin panel image'ini alohida deploy qiling:
 
-## Sessiyalar eslatmasi
+   ```bash
+   fly apps create moyskladoy-admin # faqat birinchi marta
+   fly deploy --config fly.admin.toml
+   ```
 
-Hozirgi admin sessiyalari API jarayonining xotirasida. Multi-instance deploy'da
-sticky session yoki keyingi versiyada Redisga ko'chirish kerak (docs/TODO).
+   Admin `/api/*` so'rovlarini `apps/admin/next.config.mjs`dagi build-vaqt rewrite orqali `https://moyskladoy.fly.dev`ga yuboradi. Bu manzil image build vaqtida belgilanadi; Fly runtime env'ni o'zgartirish bilan proxy manzili almashmaydi. Boshqa API domeni kerak bo'lsa, Next/Docker build konfiguratsiyasidagi `API_INTERNAL_URL`ni o'zgartirib admin image'ni qayta build/deploy qiling.
+
+4. Bot `BOT_MODE=polling`da ishlaydi; webhook/domain/sertifikat talab qilinmaydi. `REDIS_URL` ixtiyoriy — Redis bo'lmasa worker bitta mashinada in-process intervaldan foydalanadi. API sessiya va login limiteri RAM'da, shu sabab API'ni bitta machine/instance'da qoldiring.
+
+### Fly deploy tekshiruvi (`curl`)
+
+Quyidagi misollar shell'da `ADMIN_EMAIL`/`ADMIN_PASSWORD` env variable oldindan mavjud deb hisoblaydi. Hech qachon parolni Git'ga yoki chatga yozmang.
+
+```bash
+API=https://moyskladoy.fly.dev
+ADMIN=https://moyskladoy-admin.fly.dev
+curl -fsS "$API/healthz"
+curl -fsSI "$ADMIN/"
+
+LOGIN=$(curl -fsS -c /tmp/moyskladoy-cookie.txt \
+  -H 'content-type: application/json' \
+  -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" \
+  "$ADMIN/api/admin/login")
+CSRF=$(printf '%s' "$LOGIN" | jq -r .csrf)
+curl -fsS -b /tmp/moyskladoy-cookie.txt "$ADMIN/api/admin/funnel?by=week&cohort=weekly"
+curl -fsS -b /tmp/moyskladoy-cookie.txt "$ADMIN/api/admin/campaigns"
+curl -fsS -b /tmp/moyskladoy-cookie.txt "$ADMIN/api/admin/sms/balance"
+```
+
+Bu login va API chaqiruvlari admin'ning `/api/*` rewrite/proxy'sini ham tekshiradi. Yozuvchi API tekshiruvida `-H "x-csrf-token:$CSRF"` yuboring. CSV misol: `curl -b /tmp/moyskladoy-cookie.txt -OJ "$ADMIN/api/admin/campaigns/<id>/export.csv"`. `API` o'zgaruvchisi health check uchun ishlatiladi.
+
+### Yangilash / rollback
+
+```bash
+fly deploy --config fly.toml       # release command db push'ni ham bajaradi
+fly deploy --config fly.admin.toml
+```
+
+App rollback uchun `fly releases rollback --app moyskladoy` (va zarur bo'lsa `--app moyskladoy-admin`) ishlating. Schema faqat additive bo'lgani uchun ustun/jadvallarni rollback paytida qo'lda o'chirmang. Buzuvchi schema o'zgarishi bu ish doirasiga kirmaydi.
+
+## Backup va kuzatish
+
+- Postgres: `fly postgres backup create --app moyskladoy-db` yoki provider tavsiya qilgan schedule. Compose uchun: `docker compose exec postgres pg_dump -U postgres moyskladoy | gzip > backup-$(date +%F).sql.gz`.
+- Tiklashni production'da qilishdan oldin backup nusxasida sinang.
+- Har deploydan keyin `GET /healthz`; API, bot, worker process loglarini kuzating.
+- SMS balans/hisobotlari admin panelda; provider credentials yo'q bo'lsa nomlari aniq ko'rsatiladi.
+- Media `file_id` Telegram CDN'da, katalog/boshqa metadata DB'da saqlanadi.
+
+## Cheklovlar
+
+- Fly API app bitta instance: admin sessiyalari va login limiteri jarayon xotirasida.
+- Bot grammY long polling bilan ishlaydi; Redis shart emas.
+- Admin proxy URL build-time; runtime `API_INTERNAL_URL` o'zgarishi Next rewrite'ni yangilamaydi.
+- SMS uchun `SMS_USER`, `SMS_PASSWORD` ixtiyoriy; maxfiy qiymatlarni Fly secrets'da saqlang, repoga qo'shmang.

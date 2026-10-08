@@ -24,8 +24,11 @@ import type {
   TelegramUser,
 } from '@app/shared';
 import {
+  CONSENT_TEXT_VERSION,
   FREE_TEXT_STAGES,
+  isWithinAttributionWindow,
   SETTING_KEYS,
+  normalizeE164,
   maskPhone,
   tashkentDayKey,
   toPlainText,
@@ -130,8 +133,35 @@ export class BotEngine {
     return user;
   }
 
-  private setState(userId: string, patch: Partial<ConversationState>): Promise<ConversationState> {
-    return this.db.updateState(userId, patch);
+  private async metric(label: string, work: () => Promise<unknown>): Promise<void> {
+    try {
+      await work();
+    } catch (e) {
+      this.log('warn', `analytics ${label} failed: ${(e as Error).message.slice(0, 140)}`);
+    }
+  }
+
+  private async setState(userId: string, patch: Partial<ConversationState>): Promise<ConversationState> {
+    const before = patch.stage !== undefined ? await this.db.getState(userId) : null;
+    const updated = await this.db.updateState(userId, patch);
+    if (before && patch.stage !== undefined && before.stage !== patch.stage) {
+      const completedAt = new Date();
+      await Promise.all([
+        this.metric('stage_progress_complete', () => this.db.completeStageProgress(userId, before.stage, completedAt, 'completed')),
+        this.metric('stage_completed', () => this.db.recordEvent('stage_completed', { userId, properties: { stageKey: before.stage, nextStage: patch.stage, completedAt: completedAt.toISOString() } })),
+      ]);
+    }
+    return updated;
+  }
+
+  private async recordStageViewed(user: TelegramUser, stageKey: string, block: ContentBlock): Promise<void> {
+    const stepOrder = Math.max(0, [...KNOWN_STAGES].indexOf(stageKey));
+    await Promise.all([
+      this.metric('stage_progress_view', () => this.db.upsertStageProgress(user.id, stageKey, stepOrder)),
+      this.metric('stage_viewed', () => this.db.recordEvent('stage_viewed', { userId: user.id, properties: { stageKey, blockId: block.id, stepOrder } })),
+      // Eski dashboard/statistika bilan orqaga mos saqlanadi.
+      this.metric('legacy_stage_event', () => this.db.recordEvent(`stage:${stageKey}`, { userId: user.id, dedupeKey: `${user.id}:stage:${stageKey}:${this.dayStamp()}` })),
+    ]);
   }
 
   private async setting(key: string): Promise<unknown> {
@@ -170,10 +200,7 @@ export class BotEngine {
       }
       const ok = await this.sendBlock(user, state, block, meta);
       if (ok) {
-        await this.db.recordEvent(`stage:${state.stage}`, {
-          userId: user.id,
-          dedupeKey: `${user.id}:stage:${state.stage}:${this.dayStamp()}`,
-        });
+        await this.recordStageViewed(user, state.stage, block);
         return;
       }
       // Media yo'q va fallback yo'q - bo'lim o'tkazib yuboriladi (17/03 qoida).
@@ -288,6 +315,8 @@ export class BotEngine {
   }
 
   private async userPhone(user: TelegramUser): Promise<string | null> {
+    const stored = await this.db.getUserPhone(user.id);
+    if (stored?.phone) return stored.phone;
     if (!user.siteLeadId) return null;
     const site = await this.db.getSiteLeadById(user.siteLeadId);
     return site?.phone ? site.phone : null;
@@ -409,17 +438,49 @@ export class BotEngine {
   async handleStart(meta: BotMessageMeta, tg: { username?: string; firstName?: string; languageCode?: string }, startParam?: string): Promise<void> {
     return this.enqueue(meta.telegramId, async () => {
       const user = await this.ensureUser(meta, tg);
+      let attributedSiteLeadId: string | undefined;
       if (startParam && startParam.length >= 6 && startParam.length <= 64) {
         const claim = await this.db.claimLinkToken(startParam, user.id);
         if (claim.ok && claim.token) {
+          attributedSiteLeadId = claim.token.siteLeadId;
           const lead = await this.db.getSiteLeadById(claim.token.siteLeadId);
-          if (lead) await this.db.updateUser(user.id, { siteLeadId: lead.id });
+          if (lead) {
+            await this.db.updateUser(user.id, { siteLeadId: lead.id });
+            if (lead.consentMarketing) {
+              await this.metric('site_marketing_consent_transfer', async () => {
+                if (!(await this.db.hasActiveConsent(user.id, 'marketing'))) {
+                  await this.db.grantConsent(user.id, 'marketing', lead.consentVersion);
+                  await this.db.recordEvent('marketing_consent_granted', { userId: user.id, properties: { source: 'site', siteLeadId: lead.id, version: lead.consentVersion } });
+                  await this.db.audit({ actorId: null, action: 'marketing.consent.transfer', entity: 'consent', entityId: user.id, before: null, after: { source: 'site', siteLeadId: lead.id, version: lead.consentVersion }, ip: null });
+                }
+              });
+            }
+            await this.metric('site_phone_transfer', async () => {
+              if (await this.db.getUserPhone(user.id)) return;
+              const phone = normalizeE164(lead.phone);
+              if (phone) await this.db.upsertUserPhone(user.id, phone, { verified: false, smsConsent: false });
+            });
+          }
           await this.db.recordEvent('link_token_claimed', { userId: user.id, siteLeadId: lead?.id, dedupeKey: `${user.id}:link_claimed` });
+          await this.metric('link_opened', () => this.db.recordEvent('link_opened', {
+            userId: user.id,
+            siteLeadId: lead?.id,
+            dedupeKey: `link-open:${claim.token!.id}`,
+            properties: { source: 'site_lead_link' },
+          }));
         } else {
           this.log('info', `link token not usable: ${claim.reason ?? 'invalid'} for user ${user.id}`);
         }
       }
-      await this.db.recordEvent('bot_start', { userId: user.id, dedupeKey: `${user.id}:first_start` });
+      const sourceKind = startParam ? 'deep_link' : 'organic';
+      const safeSource = attributedSiteLeadId ? 'site_lead_link'
+        : !startParam ? null
+          : startParam.startsWith('campaign:') ? startParam.slice(0, 64)
+            : startParam.length >= 24 ? 'deep_link'
+              : `start:${startParam.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'other'}`;
+      // Never persist a site link token in analytics; the lead relation is enough for UTM attribution.
+      await this.metric('bot_start', () => this.db.recordEvent('bot_start', { userId: user.id, dedupeKey: `${user.id}:first_start`, properties: { sourceKind } }));
+      await this.metric('start_source', () => this.db.recordEvent('start_source', { userId: user.id, siteLeadId: attributedSiteLeadId, properties: { source: safeSource, sourceKind } }));
       const state = await this.db.getState(user.id);
       if (state && state.stage !== 'START') {
         const menu = await this.db.getBlockByKey(K.menu, 'approved');
@@ -450,7 +511,33 @@ export class BotEngine {
       const state = await this.db.getState(user.id);
       if (!state) return;
       try {
+        const currentBlock = await this.db.getBlockByStage(state.stage, 'approved').catch(() => null);
+        if (currentBlock) {
+          const type = `button_click:${currentBlock.id}`;
+          await this.metric('button_click', () => this.db.recordEvent(type, { userId: user.id, properties: { blockId: currentBlock.id, stageKey: state.stage, action: meta.data } }));
+        }
         switch (kind) {
+          case 'campaign': {
+            const campaignId = arg.slice(0, 80);
+            await this.metric('campaign_click', () => this.db.recordEvent('campaign_click', { userId: user.id, properties: { campaignId, stageKey: state.stage } }));
+            await this.metric('link_opened', () => this.db.recordEvent('link_opened', { userId: user.id, properties: { campaignId } }));
+            await this.safeAnswer(meta.callbackId, 'Havola qayd etildi.');
+            break;
+          }
+          case 'smsconsent': {
+            const phone = await this.db.getUserPhone(user.id);
+            if (arg === 'grant' && phone) {
+              await this.db.updateUserPhone(user.id, { smsConsent: true });
+              await this.db.grantConsent(user.id, 'sms_marketing', CONSENT_TEXT_VERSION);
+              await this.metric('sms_consent_granted', () => this.db.recordEvent('sms_consent_granted', { userId: user.id, properties: { source: 'telegram', version: CONSENT_TEXT_VERSION } }));
+              await this.metric('sms_consent_audit', () => this.db.audit({ actorId: null, action: 'sms.consent.grant', entity: 'user_phone', entityId: phone.id, before: { smsConsent: false }, after: { smsConsent: true, version: CONSENT_TEXT_VERSION }, ip: null }));
+              await this.safeAnswer(meta.callbackId, 'SMS roziligi saqlandi.');
+            } else {
+              await this.db.updateState(user.id, { answers: { ...state.answers, sms_consent_asked: '1' } });
+              await this.safeAnswer(meta.callbackId, 'Keyinroq davom etasiz.');
+            }
+            break;
+          }
           case 'goto':
             await this.handleGoto(user, state, arg, meta);
             break;
@@ -567,6 +654,7 @@ export class BotEngine {
       if (value === 'phone') {
         // saytdan telefon bor - darhol ko'rib chiqishga o'tamiz
         await this.setState(user.id, { stage: 'PREFERRED_TIME' });
+        await this.offerSmsConsent(user, state, meta);
         await this.renderStage(user, meta);
         return;
       }
@@ -614,6 +702,7 @@ export class BotEngine {
       if (!link) return;
       await this.setState(user.id, { lessonLinkClickedAt: new Date() });
       await this.db.recordEvent('lesson_link_clicked', { userId: user.id, dedupeKey: `${user.id}:lesson_clicked:${this.dayStamp()}` });
+      await this.metric('link_opened', () => this.db.recordEvent('link_opened', { userId: user.id, dedupeKey: `link-open:lesson:${user.id}:${this.dayStamp()}`, properties: { source: 'lesson' } }));
       await this.msg.sendText(meta.chatId, "Havolani ochdingiz. Ochish - ko'rish emas: darsni ko'rib bo'lgach \"Ko'rdim\" tugmasini bosing.");
       return;
     }
@@ -934,21 +1023,73 @@ export class BotEngine {
     }
   }
 
+  private async offerSmsConsent(user: TelegramUser, state: ConversationState, meta: BotMessageMeta): Promise<void> {
+    const phone = await this.db.getUserPhone(user.id);
+    if (!phone) return;
+    if (phone.smsConsent && await this.db.hasActiveConsent(user.id, 'sms_marketing')) return;
+    const fresh = await this.db.getState(user.id);
+    const answers = fresh?.answers ?? state.answers;
+    if (answers.sms_consent_asked === '1') return;
+    await this.setState(user.id, { answers: { ...answers, sms_consent_asked: '1' } });
+    await this.msg.sendText(meta.chatId, "Ixtiyoriy: SMS orqali yangilik olishga rozimisiz? Istalgan payt REJECT deb bekor qilishingiz mumkin.", [
+      { label: 'Ha, roziman', action: 'smsconsent:grant' },
+      { label: 'Keyinroq', action: 'smsconsent:later' },
+    ]);
+  }
+
   /** Erkin matn: faqat free-text bosqichlarida qabul qilinadi. */
-  async handleText(meta: BotMessageMeta, raw: string, contact?: { phone?: string }): Promise<void> {
+  async handleText(meta: BotMessageMeta, raw: string, contact?: { phone?: string; verified?: boolean }): Promise<void> {
     return this.enqueue(meta.telegramId, async () => {
       const user = await this.db.getUserByTelegramId(meta.telegramId);
       if (!user) return;
       const state = await this.db.getState(user.id);
       if (!state) return;
       if (contact?.phone) {
-        const phone = contact.phone.replace(/[^\d+]/g, '').slice(0, 20);
+        const phone = normalizeE164(contact.phone);
+        if (!phone) {
+          await this.msg.sendText(meta.chatId, "Telefon raqami +998 formatida bo'lishi kerak.");
+          return;
+        }
+        await this.db.upsertUserPhone(user.id, phone, { verified: contact.verified ?? false });
         await this.setState(user.id, { contactMethod: 'phone', answers: { ...state.answers, phone }, stage: 'PREFERRED_TIME' });
+        await this.offerSmsConsent(user, state, meta);
         await this.renderStage(user, meta);
         return;
       }
       const text = toPlainText(raw).slice(0, 500);
       if (!text) return;
+      if (text.trim().toUpperCase() === 'REJECT') {
+        const phone = await this.db.getUserPhone(user.id);
+        if (phone?.smsConsent) {
+          await this.db.updateUserPhone(user.id, { smsConsent: false });
+          await this.db.revokeConsent(user.id, 'sms_marketing');
+          await this.metric('sms_consent_revoked', () => this.db.recordEvent('sms_consent_revoked', { userId: user.id, properties: { source: 'REJECT' } }));
+          await this.metric('sms_consent_audit', () => this.db.audit({ actorId: null, action: 'sms.consent.revoke', entity: 'user_phone', entityId: phone.id, before: { smsConsent: true }, after: { smsConsent: false, source: 'REJECT' }, ip: null }));
+        }
+        await this.msg.sendText(meta.chatId, 'SMS roziligi bekor qilindi.');
+        return;
+      }
+      if (state.contactMethod === 'phone' && state.stage === 'PREFERRED_TIME' && !await this.db.getUserPhone(user.id)) {
+        const phone = normalizeE164(text);
+        if (phone) {
+          await this.db.upsertUserPhone(user.id, phone, { verified: false });
+          await this.setState(user.id, { answers: { ...state.answers, phone } });
+          await this.offerSmsConsent(user, state, meta);
+          await this.renderStage(user, meta);
+          return;
+        }
+      }
+      await this.metric('campaign_reply', async () => {
+        const now = new Date();
+        const recent = await this.db.listOutbox({ userId: user.id, status: 'sent', limit: 50 });
+        const attributed = recent
+          .filter((sent) => sent.campaignId && sent.sentAt && isWithinAttributionWindow(sent.sentAt, now, 48))
+          .sort((a, b) => (b.sentAt?.getTime() ?? 0) - (a.sentAt?.getTime() ?? 0))[0];
+        if (attributed?.campaignId) {
+          await this.db.recordEvent('campaign_reply', { userId: user.id, dedupeKey: `campaign-reply:${attributed.campaignId}:${user.id}`, properties: { campaignId: attributed.campaignId } });
+        }
+      });
+      await this.metric('conversation_message', () => this.db.appendEvent(user.id, 'message', { channel: 'telegram' }));
       const stage = state.stage;
       if (!(FREE_TEXT_STAGES as readonly string[]).includes(stage) && stage !== 'MENU') {
         const blk = await this.db.getBlockByKey('unknown', 'approved');

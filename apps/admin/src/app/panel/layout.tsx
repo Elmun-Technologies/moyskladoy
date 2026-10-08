@@ -6,6 +6,10 @@ import { api, setCsrf } from '@/lib/api';
 
 const NAV: [string, string][] = [
   ['dashboard', 'Statistika'],
+  ['funnel', 'Voronka'],
+  ['campaigns', 'Kampaniyalar'],
+  ['sms', 'SMS'],
+  ['stages', 'Bosqichlar'],
   ['leads', 'Arizalar'],
   ['users', 'Foydalanuvchilar'],
   ['content', 'Kontent'],

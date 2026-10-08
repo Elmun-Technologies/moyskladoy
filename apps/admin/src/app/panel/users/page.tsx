@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 
-interface U { id: string; telegramId: number; username: string | null; firstName: string | null; stage: string; salesStatus: string; blockedAt: string | null; phone: string | null }
+interface U { id: string; telegramId: number; username: string | null; firstName: string | null; stage: string; salesStatus: string; blockedAt: string | null; phone: string | null; phoneVerified: boolean; smsConsent: boolean }
 
 export default function Users() {
   const [q, setQ] = useState('');
@@ -33,14 +33,15 @@ export default function Users() {
       </div>
       <div className="card" style={{ overflowX: 'auto' }}>
         <table>
-          <thead><tr><th>ID</th><th>Telegram</th><th>Ism</th><th>Telefon</th><th>Bosqich</th><th>Sotuv</th><th>Holat</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Telegram</th><th>Ism</th><th>Telefon</th><th>SMS roziligi</th><th>Bosqich</th><th>Sotuv</th><th>Holat</th><th></th></tr></thead>
           <tbody>
             {users.map((u) => (
               <tr key={u.id}>
                 <td>{u.id.slice(0, 8)}</td>
                 <td>{u.username ? '@' + u.username : String(u.telegramId)}</td>
                 <td>{u.firstName ?? '-'}</td>
-                <td>{u.phone ?? <span className="muted">yashirin</span>}</td>
+                <td>{u.phone ?? <span className="muted">yashirin</span>} {u.phoneVerified && <span className="tag ok">tasdiq</span>}</td>
+                <td><span className={'tag ' + (u.smsConsent ? 'ok' : 'warn')}>{u.smsConsent ? 'bor' : 'yo\'q'}</span></td>
                 <td>{u.stage}</td>
                 <td><span className="tag">{u.salesStatus}</span></td>
                 <td>{u.blockedAt ? <span className="tag bad">blok</span> : <span className="tag ok">faol</span>}</td>

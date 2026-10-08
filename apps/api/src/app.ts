@@ -3,6 +3,7 @@
 // demo bot-simulyatsiya endpointlari. Log'larga P2P ma'lumot yozilmaydi.
 // ============================================================================
 import { randomBytes, randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
@@ -10,8 +11,8 @@ import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import type { AdminRole, Database } from '@app/shared';
-import { CONSENT_TEXT_VERSION, SETTING_KEYS, toPlainText } from '@app/shared';
+import type { AdminRole, Database, SegmentFilters, Campaign, CampaignChannel, CampaignStatus, SmsMessage, StageFunnelRow } from '@app/shared';
+import { CONSENT_TEXT_VERSION, ENGINE_STAGE_ORDER, EskizClient, estimateSmsCost, isWithinAttributionWindow, isWithinSendingWindow, isWithinSmsWindow, maskPhone, normalizeE164, sampleRecipient, SETTING_KEYS, smsSegmentCount, toPlainText, transitionCampaignStatus } from '@app/shared';
 import type { ApiConfig } from './config.js';
 import { hashIp, validateUploadName } from './security.js';
 
@@ -23,6 +24,8 @@ export interface AppDeps {
     simulate: (p: { telegramId: number; chatId?: number; text?: string; data?: string; updateId?: number }) => Promise<void>;
     sent: (tgId: number) => unknown[];
   };
+  /** Injected fake Eskiz transport for tests; real credentials are optional. */
+  smsApi?: { balance: () => Promise<{ balance: number | null; raw: Record<string, unknown> }> };
 }
 
 interface Session {
@@ -32,11 +35,73 @@ interface Session {
   csrf: string;
 }
 
+const SegmentDateRangeSchema = z.object({
+  from: z.string().max(64).optional(),
+  to: z.string().max(64).optional(),
+}).strict().superRefine((range, ctx) => {
+  for (const key of ['from', 'to'] as const) {
+    const value = range[key];
+    if (value && !Number.isFinite(Date.parse(value))) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'invalid_date' });
+  }
+  if (range.from && range.to && Date.parse(range.from) > Date.parse(range.to)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['to'], message: 'date_range_order' });
+  }
+});
+
+const SegmentFiltersSchema = z.object({
+  stageKey: z.enum(ENGINE_STAGE_ORDER).optional(),
+  stuckLongerThanDays: z.number().int().min(1).max(365).optional(),
+  anyStageIn: z.array(z.enum(ENGINE_STAGE_ORDER)).max(48).optional(),
+  neverReached: z.array(z.enum(ENGINE_STAGE_ORDER)).max(48).optional(),
+  consentMarketing: z.boolean().optional(),
+  hasPhone: z.boolean().optional(),
+  smsConsent: z.boolean().optional(),
+  lastActiveBetween: SegmentDateRangeSchema.optional(),
+  createdBetween: SegmentDateRangeSchema.optional(),
+  leadStatus: z.enum(['new', 'assigned', 'contacting', 'talked', 'later', 'purchased', 'not_fit', 'no_contact']).optional(),
+  viewedProductIds: z.array(z.string().min(1).max(100)).max(50).optional(),
+  blocked: z.literal(false).optional(),
+  languageCode: z.string().min(2).max(16).optional(),
+}).strict().superRefine((filters, ctx) => {
+  if (filters.stuckLongerThanDays !== undefined && !filters.stageKey) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['stageKey'], message: 'required_for_stuck_filter' });
+  }
+});
+
+const CampaignButtonSchema = z.object({ label: z.string().trim().min(1).max(64), action: z.string().min(1).max(64) }).strict().superRefine((button, ctx) => {
+  const allowed = [
+    /^campaign:[A-Za-z0-9_-]{1,80}$/,
+    /^goto:[A-Z_]{2,40}$/,
+    /^answer:[a-z_]{1,30}=[a-z0-9_]{1,40}$/,
+    /^task:[a-z0-9_]{1,20}$/,
+    /^lesson:(open|watched|resend|remind_tomorrow)$/,
+    /^consent:(grant|grant_marketing|no_reminders|grant_contact|decline|revoke_marketing)$/,
+    /^notif:(marketing|lessons|off|on)$/,
+    /^contact:(phone|telegram)$/,
+    /^submit:(send|edit)$/,
+    /^cmd:(menu|stop|ask|back|edit)$/,
+  ];
+  if (!allowed.some((pattern) => pattern.test(button.action))) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['action'], message: 'button_action_not_allowed' });
+});
+
+function csvCell(value: unknown): string {
+  let text = value === null || value === undefined ? '' : String(value);
+  if (/^[=+@\-\t\r]/.test(text)) text = "'" + text;
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function csvRow(values: unknown[]): string {
+  return values.map(csvCell).join(',') + '\r\n';
+}
+
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { db, cfg } = deps;
   const app = Fastify({ logger: false, bodyLimit: 10 * 1024 * 1024 });
   const sessions = new Map<string, Session>();
   const loginAttempts = new Map<string, { count: number; first: number }>();
+  const smsConfigured = !!(process.env.SMS_USER && process.env.SMS_PASSWORD);
+  const smsApi = deps.smsApi ?? (smsConfigured ? new EskizClient({ email: process.env.SMS_USER!, password: process.env.SMS_PASSWORD!, from: process.env.SMS_FROM ?? '4546' }) : null);
+  const smsUnitPrice = Math.max(0, Number(process.env.SMS_PRICE_PER_PART_UZS ?? 95));
 
   await app.register(helmet, { contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"] } } });
   await app.register(cookie, { secret: cfg.sessionSecret });
@@ -86,7 +151,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       consentMarketing: b.consentMarketing,
       consentVersion: CONSENT_TEXT_VERSION,
     });
-    if (b.consentMarketing) await db.grantConsent('site:' + lead.id, 'marketing', CONSENT_TEXT_VERSION);
+    if (b.consentMarketing) {
+      await db.recordEvent('site_marketing_consent_granted', { siteLeadId: lead.id, dedupeKey: `site:${lead.id}:marketing:${CONSENT_TEXT_VERSION}`, properties: { source: 'site', version: CONSENT_TEXT_VERSION } });
+      await db.audit({ before: null, actorId: null, action: 'marketing.consent.grant.site', entity: 'site_lead', entityId: lead.id, after: { version: CONSENT_TEXT_VERSION }, ip: ipHash });
+    }
     const token = await db.createLinkToken(lead.id, cfg.linkTokenTtlHours);
     await db.recordEvent('site_form_submitted', { siteLeadId: lead.id, dedupeKey: 'sf:' + lead.id, properties: { ipHash, utm: b.utmSource ?? null } });
     let link: string | null = null;
@@ -179,18 +247,554 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return fn(s);
   }
 
+  async function getCampaignAttribution(campaignId: string) {
+    const events = await db.listAnalyticsEvents({ campaignId, types: ['campaign_click', 'campaign_reply', 'link_opened'], limit: 50000 });
+    const unique = (type: string) => new Set(events.filter((event) => event.type === type && event.userId).map((event) => event.userId)).size;
+    return {
+      clicks: events.filter((event) => event.type === 'campaign_click').length,
+      uniqueClickers: unique('campaign_click'),
+      replies: events.filter((event) => event.type === 'campaign_reply').length,
+      uniqueRepliers: unique('campaign_reply'),
+      linkOpens: events.filter((event) => event.type === 'link_opened').length,
+      uniqueLinkOpeners: unique('link_opened'),
+    };
+  }
+
+  async function cancelCampaignQueues(campaignId: string): Promise<number> {
+    let cancelled = 0;
+    const outbox = await db.listOutbox({ campaignId, status: 'pending', limit: 50000 });
+    for (const row of outbox) {
+      await db.updateOutbox(row.id, { status: 'cancelled', lastError: 'cancelled_by_admin', skippedReason: 'cancelled' });
+      cancelled++;
+    }
+    const smsRows = await db.listSmsMessages({ campaignId, status: 'queued', limit: 50000 });
+    for (const row of smsRows) {
+      await db.updateSmsMessage(row.id, { status: 'cancelled', lastError: 'cancelled_by_admin', skippedReason: 'cancelled' });
+      cancelled++;
+    }
+    return cancelled;
+  }
+
+  function dateWindow(query: { from?: Date; to?: Date }): { from: Date; to: Date } | null {
+    const to = query.to ?? new Date();
+    const from = query.from ?? new Date(to.getTime() - 30 * 86_400_000);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) return null;
+    return { from, to };
+  }
+
   // --- stats -----------------------------------------------------------------
   app.get('/api/admin/stats', async (req, reply) => {
     return withAuth(req, reply, ALL, false, async () => {
-            const stages = ['bot_start', 'stage:START', 'stage:EXPERIENCE_VIDEO', 'stage:LESSON_INTRO', 'task_answered', 'lesson_self_reported_watched', 'stage:OFFERS', 'sales_lead_created', 'link_token_claimed'];
+      const stages = ['bot_start', 'stage:START', 'stage:EXPERIENCE_VIDEO', 'stage:LESSON_INTRO', 'task_answered', 'lesson_self_reported_watched', 'stage:OFFERS', 'sales_lead_created', 'link_token_claimed'];
       const funnel: Record<string, { total: number; users: number }> = {};
-      for (const t of stages) {
-        funnel[t] = { total: await db.countEvents(t), users: await db.countUniqueUsers(t) };
-      }
-      const leads = await db.listSalesLeads({ limit: 1000 });
+      for (const t of stages) funnel[t] = { total: await db.countEvents(t), users: await db.countUniqueUsers(t) };
+      const now = new Date();
+      const [users, leads, outbox, smsRows, campaigns, topStages] = await Promise.all([
+        db.listUsers({ limit: 50000, offset: 0 }),
+        db.listSalesLeads({ limit: 50000, offset: 0 }),
+        db.listOutbox({ limit: 50000 }),
+        db.listSmsMessages({ limit: 50000 }),
+        db.listCampaigns(5),
+        db.getStageFunnel(new Date(now.getTime() - 30 * 86_400_000), now),
+      ]);
       const byStatus: Record<string, number> = {};
       for (const l of leads.leads) byStatus[l.status] = (byStatus[l.status] ?? 0) + 1;
-      return { funnel, leads: { total: leads.total, byStatus } };
+      const windows = [
+        ['today', 1], ['7d', 7], ['30d', 30],
+      ] as const;
+      const periods: Record<string, { newUsers: number; completed: number; conversionPct: number; active: number; leads: number; messagesSent: number }> = {};
+      for (const [key, days] of windows) {
+        const since = new Date(now.getTime() - days * 86_400_000);
+        const newUsers = users.users.filter((u) => u.createdAt >= since).length;
+        const completedUsers = new Set((await db.listEventsByType('sales_lead_created', since, 50000)).map((e) => e.userId).filter(Boolean)).size;
+        const startUsers = await db.countUniqueUsers('bot_start', since);
+        const active = users.users.filter((u) => u.lastSeenAt && u.lastSeenAt >= since).length;
+        const leadCount = leads.leads.filter((l) => l.createdAt >= since).length;
+        const messageCount = outbox.filter((m) => m.payload.testOnly !== true && m.status === 'sent' && m.sentAt && m.sentAt >= since).length + smsRows.filter((m) => !m.isTest && ['sent', 'delivered'].includes(m.status) && m.sentAt && m.sentAt >= since).length;
+        periods[key] = { newUsers, completed: completedUsers, conversionPct: startUsers ? Math.round(completedUsers / startUsers * 10000) / 100 : 0, active, leads: leadCount, messagesSent: messageCount };
+      }
+      const recentCampaigns = await Promise.all(campaigns.map(async (campaign) => ({ ...campaign, stats: await db.getCampaignDeliverySummary(campaign.id) })));
+      return {
+        funnel,
+        leads: { total: leads.total, byStatus },
+        periods,
+        topStages: topStages.sort((a, b) => b.viewed - a.viewed).slice(0, 8),
+        campaigns: recentCampaigns,
+      };
+    });
+  });
+
+  // --- segments: preview/sample + saved filters -------------------------------
+  app.post('/api/admin/segments/preview', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async (s) => {
+      const b = z.object({ channel: z.enum(['telegram', 'sms']), filters: SegmentFiltersSchema.default({}) }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'validation', details: b.error.issues.map((issue) => issue.path.join('.')) });
+      const result = await db.previewSegment(b.data.filters, b.data.channel);
+      const sample = result.sample.map((recipient) => {
+        const row = sampleRecipient(recipient);
+        return s.role === 'content_editor' ? { ...row, phone: row.phone ? maskPhone(row.phone) : null } : row;
+      });
+      return { ok: true, count: result.count, sample, filters: b.data.filters, channel: b.data.channel };
+    });
+  });
+
+  app.get('/api/admin/segments', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => ({ segments: await db.listSavedSegments() }));
+  });
+
+  app.post('/api/admin/segments', async (req, reply) => {
+    return withAuth(req, reply, ['admin', 'content_editor'], true, async (s) => {
+      const b = z.object({ name: z.string().trim().min(1).max(100), filters: SegmentFiltersSchema }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'validation' });
+      const segment = await db.createSavedSegment({ name: b.data.name, ownerId: s.adminId, filtersJson: b.data.filters as SegmentFilters });
+      await db.audit({ actorId: s.adminId, action: 'segment.create', entity: 'saved_segment', entityId: segment.id, before: null, after: { name: segment.name }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.code(201).send({ ok: true, segment });
+    });
+  });
+
+  app.delete('/api/admin/segments/:id', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const deleted = await db.deleteSavedSegment(p.data.id);
+      if (!deleted) return reply.code(404).send({ ok: false, error: 'not_found' });
+      await db.audit({ actorId: s.adminId, action: 'segment.delete', entity: 'saved_segment', entityId: p.data.id, before: null, after: null, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true });
+    });
+  });
+
+  // --- funnel / retention / source and button analytics ------------------------
+  app.get('/api/admin/funnel', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const q = z.object({
+        from: z.coerce.date().optional(), to: z.coerce.date().optional(),
+        by: z.enum(['day', 'week']).default('day'),
+        stuckAfterDays: z.coerce.number().int().min(0).max(365).default(7),
+        cohort: z.literal('weekly').optional(),
+      }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false, error: 'bad_query' });
+      const window = dateWindow(q.data);
+      if (!window) return reply.code(400).send({ ok: false, error: 'bad_date_range' });
+      const [tracked, series, cohorts] = await Promise.all([
+        db.getStageFunnel(window.from, window.to, q.data.stuckAfterDays),
+        db.getStageFunnelSeries(window.from, window.to, q.data.by),
+        q.data.cohort === 'weekly' ? db.getRetentionCohorts(window.from, window.to) : Promise.resolve([]),
+      ]);
+      const trackedByKey = new Map(tracked.map((row) => [row.stageKey, row]));
+      const stages: StageFunnelRow[] = ENGINE_STAGE_ORDER.map((stageKey, stepOrder) => trackedByKey.get(stageKey) ?? {
+        stageKey, stepOrder, viewed: 0, completed: 0, stuck: 0, conversionPct: 0, medianMinutes: null,
+      });
+      return { ok: true, from: window.from.toISOString(), to: window.to.toISOString(), by: q.data.by, hasData: tracked.length > 0, stages, series, cohorts };
+    });
+  });
+
+  app.get('/api/admin/retention', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const q = z.object({ from: z.coerce.date().optional(), to: z.coerce.date().optional() }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false });
+      const window = dateWindow(q.data);
+      if (!window) return reply.code(400).send({ ok: false, error: 'bad_date_range' });
+      return { ok: true, from: window.from.toISOString(), to: window.to.toISOString(), cohorts: await db.getRetentionCohorts(window.from, window.to) };
+    });
+  });
+
+  app.get('/api/admin/analytics/sources', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const q = z.object({ from: z.coerce.date().optional(), to: z.coerce.date().optional() }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false });
+      const window = dateWindow(q.data);
+      if (!window) return reply.code(400).send({ ok: false, error: 'bad_date_range' });
+      const events = await db.listAnalyticsEvents({ types: ['start_source'], from: window.from, to: window.to, limit: 50000 });
+      const sources = new Map<string, { starts: number; users: Set<string> }>();
+      const leadCache = new Map<string, string>();
+      for (const event of events) {
+        const raw = event.properties?.source;
+        let label = 'organic';
+        let mapped: string | undefined;
+        if (event.siteLeadId) {
+          const key = `lead:${event.siteLeadId}`;
+          mapped = leadCache.get(key);
+          if (!mapped) {
+            const lead = await db.getSiteLeadById(event.siteLeadId);
+            mapped = lead?.utmSource ? `utm:${lead.utmSource.slice(0, 40)}` : 'site_form';
+            leadCache.set(key, mapped);
+          }
+        } else if (typeof raw === 'string' && raw) {
+          // Legacy event compatibility; new events store the lead relation, not its bearer token.
+          mapped = leadCache.get(raw);
+          if (!mapped) {
+            const token = await db.getLinkToken(raw);
+            if (token) {
+              const lead = await db.getSiteLeadById(token.siteLeadId);
+              mapped = lead?.utmSource ? `utm:${lead.utmSource.slice(0, 40)}` : 'site_form';
+              leadCache.set(raw, mapped);
+            }
+          }
+        }
+        if (mapped) label = mapped;
+        else if (typeof raw === 'string' && raw) {
+          if (/^campaign:[A-Za-z0-9_-]{1,80}$/.test(raw)) label = raw;
+          else if (raw === 'site_lead_link' || raw === 'deep_link') label = 'deep_link';
+          else label = `start:${raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40) || 'other'}`;
+        }
+        const row = sources.get(label) ?? { starts: 0, users: new Set<string>() };
+        row.starts++;
+        if (event.userId) row.users.add(event.userId);
+        sources.set(label, row);
+      }
+      return { ok: true, sources: [...sources.entries()].map(([source, row]) => ({ source, starts: row.starts, uniqueUsers: row.users.size })).sort((a, b) => b.starts - a.starts) };
+    });
+  });
+
+  app.get('/api/admin/analytics/buttons', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const q = z.object({ from: z.coerce.date().optional(), to: z.coerce.date().optional() }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false });
+      const window = dateWindow(q.data);
+      if (!window) return reply.code(400).send({ ok: false, error: 'bad_date_range' });
+      const events = await db.listAnalyticsEvents({ typePrefix: 'button_click:', from: window.from, to: window.to, limit: 50000 });
+      const grouped = new Map<string, { stageKey: string; blockId: string; action: string; clicks: number; users: Set<string> }>();
+      for (const event of events) {
+        const props = event.properties ?? {};
+        const blockId = typeof props.blockId === 'string' ? props.blockId : event.type.slice('button_click:'.length);
+        const stageKey = typeof props.stageKey === 'string' ? props.stageKey : 'UNKNOWN';
+        const action = typeof props.action === 'string' ? props.action : '';
+        const key = `${blockId}:${action}`;
+        const row = grouped.get(key) ?? { stageKey, blockId, action, clicks: 0, users: new Set<string>() };
+        row.clicks++;
+        if (event.userId) row.users.add(event.userId);
+        grouped.set(key, row);
+      }
+      return { ok: true, buttons: [...grouped.values()].map(({ users, ...row }) => ({ ...row, uniqueUsers: users.size })).sort((a, b) => b.clicks - a.clicks) };
+    });
+  });
+
+  // --- Telegram/SMS campaigns --------------------------------------------------
+  app.get('/api/admin/campaigns', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const q = z.object({ limit: z.coerce.number().int().min(1).max(100).default(30) }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false });
+      const campaigns = await db.listCampaigns(q.data.limit);
+      return {
+        campaigns: await Promise.all(campaigns.map(async (campaign) => ({
+          ...campaign,
+          stats: await db.getCampaignDeliverySummary(campaign.id),
+        }))),
+        smsConfigured: !!smsApi,
+        smsMissingEnv: smsApi ? [] : ['SMS_USER', 'SMS_PASSWORD'],
+      };
+    });
+  });
+
+  app.post('/api/admin/campaigns', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const b = z.object({
+        name: z.string().trim().min(1).max(100),
+        channel: z.enum(['telegram', 'sms']),
+        filters: SegmentFiltersSchema.default({}),
+        templateText: z.string().trim().min(1).max(4000),
+        buttons: z.array(CampaignButtonSchema).max(10).default([]),
+        mediaId: z.string().min(1).max(100).nullable().optional(),
+        scheduledFor: z.string().datetime().nullable().optional(),
+      }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'validation', details: b.error.issues.map((issue) => issue.path.join('.')) });
+      if (b.data.channel === 'sms' && (b.data.templateText.length > 3500 || b.data.buttons.length || b.data.mediaId)) {
+        return reply.code(422).send({ ok: false, error: 'sms_campaign_content_invalid' });
+      }
+      const scheduledFor = b.data.scheduledFor ? new Date(b.data.scheduledFor) : null;
+      if (scheduledFor && scheduledFor <= new Date()) return reply.code(422).send({ ok: false, error: 'schedule_must_be_future' });
+      let mediaId: string | null = null;
+      if (b.data.mediaId) {
+        if (b.data.channel !== 'telegram') return reply.code(422).send({ ok: false, error: 'sms_media_not_supported' });
+        const media = await db.getMedia(b.data.mediaId);
+        if (!media?.fileId || media.status !== 'approved') return reply.code(422).send({ ok: false, error: 'media_not_approved' });
+        mediaId = media.id;
+      }
+      const campaign = await db.createCampaign({
+        name: b.data.name,
+        channel: b.data.channel as CampaignChannel,
+        segmentJson: b.data.filters as SegmentFilters,
+        templateText: b.data.templateText,
+        buttonsJson: b.data.buttons,
+        mediaId,
+        status: scheduledFor ? 'scheduled' : 'draft',
+        scheduledFor,
+        smsConfirmedAt: null,
+        createdById: s.adminId,
+      });
+      await db.audit({ actorId: s.adminId, action: 'campaign.create', entity: 'campaign', entityId: campaign.id, before: null, after: { channel: campaign.channel, status: campaign.status, scheduledFor: campaign.scheduledFor?.toISOString() ?? null }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.code(201).send({ ok: true, campaign });
+    });
+  });
+
+  app.get('/api/admin/campaigns/:id', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      const [stats, attribution] = await Promise.all([
+        db.getCampaignDeliverySummary(campaign.id),
+        getCampaignAttribution(campaign.id),
+      ]);
+      return { campaign, stats, attribution };
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/start', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      if (campaign.channel === 'sms' && !campaign.smsConfirmedAt) return reply.code(409).send({ ok: false, error: 'sms_confirmation_required' });
+      let status: CampaignStatus;
+      try { status = transitionCampaignStatus(campaign.status, 'running'); }
+      catch (error) { return reply.code(409).send({ ok: false, error: (error as Error).message }); }
+      const updated = await db.updateCampaign(campaign.id, { status, scheduledFor: null, startsAt: campaign.startsAt ?? new Date() });
+      await db.audit({ actorId: s.adminId, action: 'campaign.start', entity: 'campaign', entityId: campaign.id, before: { status: campaign.status }, after: { status: updated.status }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated });
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/schedule', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      const b = z.object({ scheduledFor: z.string().datetime() }).strict().safeParse(req.body);
+      if (!p.success || !b.success) return reply.code(400).send({ ok: false, error: 'validation' });
+      const when = new Date(b.data.scheduledFor);
+      if (when <= new Date()) return reply.code(422).send({ ok: false, error: 'schedule_must_be_future' });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      let status: CampaignStatus;
+      try { status = transitionCampaignStatus(campaign.status, 'scheduled'); }
+      catch (error) { return reply.code(409).send({ ok: false, error: (error as Error).message }); }
+      const updated = await db.updateCampaign(campaign.id, { status, scheduledFor: when });
+      await db.audit({ actorId: s.adminId, action: 'campaign.schedule', entity: 'campaign', entityId: campaign.id, before: { status: campaign.status }, after: { status: updated.status, scheduledFor: when.toISOString() }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated });
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/pause', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      let status: CampaignStatus;
+      try { status = transitionCampaignStatus(campaign.status, 'paused'); }
+      catch (error) { return reply.code(409).send({ ok: false, error: (error as Error).message }); }
+      const updated = await db.updateCampaign(campaign.id, { status });
+      await db.audit({ actorId: s.adminId, action: 'campaign.pause', entity: 'campaign', entityId: campaign.id, before: { status: campaign.status }, after: { status: updated.status }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated });
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/resume', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      if (campaign.status !== 'paused') return reply.code(409).send({ ok: false, error: 'campaign_not_paused' });
+      if (campaign.channel === 'sms' && !campaign.smsConfirmedAt) return reply.code(409).send({ ok: false, error: 'sms_confirmation_required' });
+      const keepScheduled = !!campaign.scheduledFor && campaign.scheduledFor > new Date();
+      const nextStatus: CampaignStatus = keepScheduled ? 'scheduled' : 'running';
+      const status = transitionCampaignStatus('paused', nextStatus);
+      const updated = await db.updateCampaign(campaign.id, { status, scheduledFor: keepScheduled ? campaign.scheduledFor : null, startsAt: campaign.startsAt ?? (keepScheduled ? null : new Date()) });
+      await db.audit({ actorId: s.adminId, action: 'campaign.resume', entity: 'campaign', entityId: campaign.id, before: { status: campaign.status }, after: { status: updated.status }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated });
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/cancel', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      let status: CampaignStatus;
+      try { status = transitionCampaignStatus(campaign.status, 'cancelled'); }
+      catch (error) { return reply.code(409).send({ ok: false, error: (error as Error).message }); }
+      const updated = await db.updateCampaign(campaign.id, { status, endsAt: new Date() });
+      const cancelled = await cancelCampaignQueues(campaign.id);
+      await db.audit({ actorId: s.adminId, action: 'campaign.cancel', entity: 'campaign', entityId: campaign.id, before: { status: campaign.status }, after: { status: updated.status, queuedCancelled: cancelled }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated, queuedCancelled: cancelled });
+    });
+  });
+
+  app.post('/api/admin/campaigns/:id/test', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      if (campaign.channel === 'telegram') {
+        const b = z.object({ telegramId: z.number().int().positive() }).strict().safeParse(req.body);
+        if (!b.success) return reply.code(422).send({ ok: false, error: 'telegram_id_required' });
+        const user = await db.getUserByTelegramId(b.data.telegramId);
+        if (!user) return reply.code(404).send({ ok: false, error: 'test_user_not_found' });
+        if (user.blockedAt || !(await db.hasActiveConsent(user.id, 'marketing'))) return reply.code(409).send({ ok: false, error: 'test_recipient_not_eligible' });
+        const state = await db.getState(user.id);
+        const name = user.firstName?.trim() || 'test';
+        const text = toPlainText(campaign.templateText.replace(/\{\{?\s*ism\s*\}?\}/gi, name).replace(/\{\{?\s*bosqich\s*\}?\}/gi, state?.stage ?? 'START')).slice(0, 3900);
+        const buttons = (Array.isArray(campaign.buttonsJson) ? campaign.buttonsJson : []).flatMap((entry) => {
+          if (!entry || typeof entry !== 'object') return [];
+          const button = entry as { label?: unknown; action?: unknown };
+          if (typeof button.label !== 'string' || typeof button.action !== 'string' || button.action.startsWith('campaign:')) return [];
+          return [{ label: button.label, action: button.action }];
+        }).slice(0, 10);
+        const media = campaign.mediaId ? await db.getMedia(campaign.mediaId) : null;
+        await db.enqueueOutbox({
+          userId: user.id,
+          type: 'marketing',
+          dedupeKey: `campaign-test:${campaign.id}:${randomUUID()}`,
+          payload: {
+            text, buttons, testOnly: true, chatId: user.telegramId,
+            ...(media?.fileId ? { mediaFileId: media.fileId, mediaType: media.isVideoNote ? 'video_note' : media.mimeType?.startsWith('image/') ? 'image' : 'video' } : {}),
+          },
+          scheduledFor: new Date(),
+        });
+        await db.audit({ actorId: s.adminId, action: 'campaign.test.send', entity: 'campaign', entityId: campaign.id, before: null, after: { channel: 'telegram', userId: user.id }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+        return reply.code(202).send({ ok: true, queued: true, channel: 'telegram' });
+      }
+      const b = z.object({ phone: z.string().trim().min(7).max(24) }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'phone_required' });
+      const phone = normalizeE164(b.data.phone);
+      if (!phone) return reply.code(422).send({ ok: false, error: 'bad_phone' });
+      const recipientPhone = await db.getUserPhoneByPhone(phone);
+      if (!recipientPhone?.smsConsent || !(await db.hasActiveConsent(recipientPhone.userId, 'sms_marketing'))) {
+        return reply.code(409).send({ ok: false, error: 'test_recipient_not_eligible' });
+      }
+      const message = await db.createSmsMessage({
+        campaignId: null, userId: recipientPhone.userId, phone,
+        text: toPlainText(campaign.templateText.replace(/\{\{?\s*ism\s*\}?\}/gi, 'test').replace(/\{\{?\s*bosqich\s*\}?\}/gi, 'START')).slice(0, 3500),
+        status: 'queued', externalId: null, lastError: null, skippedReason: null,
+        sentAt: null, reportedAt: null, isTest: true,
+      });
+      if (!message) return reply.code(500).send({ ok: false, error: 'test_queue_failed' });
+      await db.audit({ actorId: s.adminId, action: 'campaign.test.send', entity: 'campaign', entityId: campaign.id, before: null, after: { channel: 'sms', smsMessageId: message.id, phone: maskPhone(phone) }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.code(202).send({ ok: true, queued: true, channel: 'sms', smsMessageId: message.id, providerConfigured: !!smsApi, missingEnv: smsApi ? [] : ['SMS_USER', 'SMS_PASSWORD'] });
+    });
+  });
+
+  app.get('/api/admin/campaigns/:id/export.csv', async (req, reply) => {
+    return withAuth(req, reply, NO_EDITOR, false, async (s) => {
+      const p = z.object({ id: z.string().min(1).max(100) }).safeParse(req.params);
+      if (!p.success) return reply.code(400).send({ ok: false });
+      const campaign = await db.getCampaign(p.data.id);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      const summary = await db.getCampaignDeliverySummary(campaign.id);
+      await db.audit({ actorId: s.adminId, action: 'campaign.export.csv', entity: 'campaign', entityId: campaign.id, before: null, after: { rows: summary.planned }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      const stream = Readable.from((async function* () {
+        yield csvRow(['userId', 'telegramId', 'status', 'sentAt', 'error']);
+        const userIds = new Set<string>();
+        for (const message of await db.listOutbox({ campaignId: campaign.id, limit: 50000 })) userIds.add(message.userId);
+        for (const message of await db.listSmsMessages({ campaignId: campaign.id, limit: 50000 })) if (!message.isTest && message.userId) userIds.add(message.userId);
+        const userMap = new Map<string, number>();
+        for (const userId of userIds) {
+          const user = await db.getUserById(userId);
+          if (user) userMap.set(userId, user.telegramId);
+        }
+        let offset = 0;
+        while (true) {
+          const batch = await db.listOutbox({ campaignId: campaign.id, limit: 500, offset });
+          if (!batch.length) break;
+          for (const message of batch) yield csvRow([message.userId, userMap.get(message.userId) ?? '', message.status, message.sentAt?.toISOString() ?? '', message.lastError ?? message.skippedReason ?? '']);
+          offset += batch.length;
+          if (batch.length < 500) break;
+        }
+        offset = 0;
+        while (true) {
+          const batch = await db.listSmsMessages({ campaignId: campaign.id, limit: 500, offset });
+          if (!batch.length) break;
+          for (const message of batch) {
+            if (message.isTest) continue;
+            yield csvRow([message.userId ?? '', message.userId ? userMap.get(message.userId) ?? '' : '', message.status, message.sentAt?.toISOString() ?? '', message.lastError ?? message.skippedReason ?? '']);
+          }
+          offset += batch.length;
+          if (batch.length < 500) break;
+        }
+      })());
+      return reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', `attachment; filename="campaign-${campaign.id}.csv"`).send(stream);
+    });
+  });
+
+  // --- SMS provider: estimate/confirmation/balance/price/delivery reports -----
+  app.get('/api/admin/sms/balance', async (req, reply) => {
+    return withAuth(req, reply, NO_EDITOR, false, async () => {
+      if (!smsApi) return { ok: true, configured: false, missingEnv: ['SMS_USER', 'SMS_PASSWORD'], balance: null, currency: 'UZS' };
+      try {
+        const result = await smsApi.balance();
+        return { ok: true, configured: true, missingEnv: [], balance: result.balance, currency: 'UZS' };
+      } catch {
+        return reply.code(502).send({ ok: false, configured: true, error: 'sms_balance_unavailable' });
+      }
+    });
+  });
+
+  app.get('/api/admin/sms/price', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => ({ ok: true, unitPriceUzs: smsUnitPrice, source: process.env.SMS_PRICE_PER_PART_UZS ? 'SMS_PRICE_PER_PART_UZS' : 'default_estimate', isAccountQuote: false }));
+  });
+
+  app.post('/api/admin/sms/estimate', async (req, reply) => {
+    return withAuth(req, reply, ALL, false, async () => {
+      const b = z.object({
+        campaignId: z.string().min(1).max(100).optional(),
+        savedSegmentId: z.string().min(1).max(100).optional(),
+        filters: SegmentFiltersSchema.optional(),
+        text: z.string().min(1).max(3500).optional(),
+      }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'validation' });
+      let filters: SegmentFilters = b.data.filters ?? {};
+      let text = b.data.text ?? '';
+      if (b.data.savedSegmentId) {
+        const segment = (await db.listSavedSegments()).find((item) => item.id === b.data.savedSegmentId);
+        if (!segment) return reply.code(404).send({ ok: false, error: 'segment_not_found' });
+        if (!b.data.filters) filters = segment.filtersJson;
+      }
+      if (b.data.campaignId) {
+        const campaign = await db.getCampaign(b.data.campaignId);
+        if (!campaign) return reply.code(404).send({ ok: false, error: 'campaign_not_found' });
+        if (campaign.channel !== 'sms') return reply.code(422).send({ ok: false, error: 'not_sms_campaign' });
+        if (!b.data.filters) filters = campaign.segmentJson;
+        if (!b.data.text) text = campaign.templateText;
+      }
+      if (!text) return reply.code(422).send({ ok: false, error: 'text_required' });
+      // Price only the currently sendable segment (phone + both consent records).
+      const eligible = await db.previewSegment({ ...filters, hasPhone: true, smsConsent: true, blocked: false }, 'sms');
+      const parts = smsSegmentCount(toPlainText(text));
+      return { ok: true, recipientCount: eligible.count, partsPerRecipient: parts, unitPriceUzs: smsUnitPrice, totalUzs: estimateSmsCost(eligible.count, toPlainText(text), smsUnitPrice), isAccountQuote: false };
+    });
+  });
+
+  app.post('/api/admin/sms/confirm', async (req, reply) => {
+    return withAuth(req, reply, ADMIN_ONLY, true, async (s) => {
+      const b = z.object({ campaignId: z.string().min(1).max(100), expectedRecipientCount: z.number().int().min(0), expectedCostUzs: z.number().min(0) }).strict().safeParse(req.body);
+      if (!b.success) return reply.code(422).send({ ok: false, error: 'validation' });
+      const campaign = await db.getCampaign(b.data.campaignId);
+      if (!campaign) return reply.code(404).send({ ok: false, error: 'not_found' });
+      if (campaign.channel !== 'sms') return reply.code(422).send({ ok: false, error: 'not_sms_campaign' });
+      if (!['draft', 'scheduled'].includes(campaign.status)) return reply.code(409).send({ ok: false, error: 'campaign_not_confirmable' });
+      const eligible = await db.previewSegment({ ...campaign.segmentJson, hasPhone: true, smsConsent: true, blocked: false }, 'sms');
+      const cost = estimateSmsCost(eligible.count, toPlainText(campaign.templateText), smsUnitPrice);
+      if (eligible.count !== b.data.expectedRecipientCount || Math.abs(cost - b.data.expectedCostUzs) > 0.01) {
+        return reply.code(409).send({ ok: false, error: 'estimate_changed', estimate: { recipientCount: eligible.count, totalUzs: cost, unitPriceUzs: smsUnitPrice, partsPerRecipient: smsSegmentCount(toPlainText(campaign.templateText)) } });
+      }
+      const confirmedAt = new Date();
+      const updated = await db.updateCampaign(campaign.id, { smsConfirmedAt: confirmedAt });
+      await db.audit({ actorId: s.adminId, action: 'sms.estimate.confirm', entity: 'campaign', entityId: campaign.id, before: { smsConfirmedAt: campaign.smsConfirmedAt?.toISOString() ?? null }, after: { smsConfirmedAt: confirmedAt.toISOString(), recipientCount: eligible.count, totalUzs: cost, unitPriceUzs: smsUnitPrice }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, campaign: updated, estimate: { recipientCount: eligible.count, totalUzs: cost, unitPriceUzs: smsUnitPrice } });
+    });
+  });
+
+  app.get('/api/admin/sms/reports', async (req, reply) => {
+    return withAuth(req, reply, NO_EDITOR, false, async (s) => {
+      const q = z.object({ campaignId: z.string().min(1).max(100).optional(), status: z.enum(['queued', 'sending', 'sent', 'delivered', 'failed', 'cancelled']).optional(), limit: z.coerce.number().int().min(1).max(200).default(50), offset: z.coerce.number().int().min(0).default(0) }).strict().safeParse(req.query);
+      if (!q.success) return reply.code(400).send({ ok: false });
+      const messages = await db.listSmsMessages(q.data);
+      const safeMessages = s.role === 'content_editor' ? messages.map((m) => ({ ...m, phone: maskPhone(m.phone), text: '[yashirilgan]' })) : messages;
+      return { messages: safeMessages, limit: q.data.limit, offset: q.data.offset };
     });
   });
 
@@ -202,16 +806,24 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const r = await db.listUsers(q.data);
       const mask = s.role === 'content_editor';
       const users = await Promise.all(
-        r.users.map(async (u) => ({
-          id: u.id,
-          telegramId: u.telegramId,
-          username: u.username,
-          firstName: u.firstName,
-          blockedAt: u.blockedAt,
-          stage: u.state?.stage ?? 'START',
-          salesStatus: u.state?.salesStatus ?? 'none',
-          phone: mask ? null : u.siteLeadId ? ((await db.getSiteLeadById(u.siteLeadId))?.phone ?? null) : null,
-        })),
+        r.users.map(async (u) => {
+          const [phone, siteLead] = await Promise.all([
+            db.getUserPhone(u.id),
+            u.siteLeadId ? db.getSiteLeadById(u.siteLeadId) : Promise.resolve(null),
+          ]);
+          return {
+            id: u.id,
+            telegramId: u.telegramId,
+            username: u.username,
+            firstName: u.firstName,
+            blockedAt: u.blockedAt,
+            stage: u.state?.stage ?? 'START',
+            salesStatus: u.state?.salesStatus ?? 'none',
+            phone: mask ? null : phone?.phone ?? siteLead?.phone ?? null,
+            phoneVerified: mask ? false : phone?.verified ?? false,
+            smsConsent: mask ? false : phone?.smsConsent ?? false,
+          };
+        }),
       );
       return { users, total: r.total };
     });

@@ -1,12 +1,27 @@
 import { randomUUID } from 'node:crypto';
+import { DateTime } from 'luxon';
 import type { Database, CreateSalesLeadInput, CreateSiteLeadInput, CreateUserInput, BlockStatusFilter } from '../database.js';
+import { matchesSegment } from '../marketing.js';
 import type {
   AdminUser,
   AnalyticsEvent,
   AuditLogEntry,
+  Campaign,
+  CampaignChannel,
+  CampaignDeliverySummary,
+  CampaignRecipient,
+  ConversationEvent,
+  RetentionCohort,
+  SavedSegment,
+  SegmentFilters,
+  SmsMessage,
+  SmsMessageStatus,
+  StageFunnelPoint,
+  StageFunnelRow,
+  StageProgress,
+  UserPhone,
   Consent,
   ContentBlock,
-  ConversationEvent,
   ConversationState,
   HelpRequest,
   LeadProductView,
@@ -48,9 +63,12 @@ function clone<T>(v: T): T {
 export class MemoryDatabase implements Database {
   readonly users = new Map<string, TelegramUser>();
   readonly usersByTelegramId = new Map<number, string>();
+  readonly userPhones = new Map<string, UserPhone>();
+  readonly userIdsByPhone = new Map<string, string>();
   readonly siteLeads = new Map<string, SiteLead>();
   readonly linkTokens = new Map<string, LinkToken>(); // by token string
   readonly states = new Map<string, ConversationState>(); // by userId
+  readonly stageProgress = new Map<string, StageProgress>(); // unique userId+stageKey
   readonly events: ConversationEvent[] = [];
   readonly consents: Consent[] = [];
   readonly products = new Map<string, Product>();
@@ -64,6 +82,9 @@ export class MemoryDatabase implements Database {
   readonly helpRequests = new Map<string, HelpRequest>();
   readonly admins = new Map<string, AdminUser>();
   readonly outbox: OutboxMessage[] = [];
+  readonly campaigns = new Map<string, Campaign>();
+  readonly smsMessages = new Map<string, SmsMessage>();
+  readonly savedSegments = new Map<string, SavedSegment>();
   readonly analytics: AnalyticsEvent[] = [];
   readonly auditLog: AuditLogEntry[] = [];
   readonly settings = new Map<string, unknown>();
@@ -80,6 +101,7 @@ export class MemoryDatabase implements Database {
       u.firstName = input.firstName ?? u.firstName;
       u.lastName = input.lastName ?? u.lastName;
       u.languageCode = input.languageCode ?? u.languageCode;
+      u.lastSeenAt = now;
       u.updatedAt = now;
       return clone(u);
     }
@@ -91,7 +113,7 @@ export class MemoryDatabase implements Database {
       lastName: input.lastName ?? null,
       languageCode: input.languageCode ?? null,
       blockedAt: null,
-      lastSeenAt: null,
+      lastSeenAt: now,
       siteLeadId: null,
       createdAt: now,
       updatedAt: now,
@@ -147,6 +169,52 @@ export class MemoryDatabase implements Database {
       users: list.map((u) => ({ ...clone(u), state: this.states.get(u.id) ? clone(this.states.get(u.id)!) : null })),
       total,
     };
+  }
+
+  async upsertUserPhone(userId: string, phone: string, patch: { verified?: boolean; smsConsent?: boolean } = {}): Promise<UserPhone> {
+    if (!this.users.has(userId)) throw new Error(`user not found: ${userId}`);
+    const taken = this.userIdsByPhone.get(phone);
+    if (taken && taken !== userId) throw new Error('phone_already_in_use');
+    const now = new Date();
+    const previous = this.userPhones.get(userId);
+    if (previous && previous.phone !== phone) this.userIdsByPhone.delete(previous.phone);
+    const row: UserPhone = {
+      id: previous?.id ?? nid('phone'), userId, phone,
+      verified: patch.verified ?? previous?.verified ?? false,
+      smsConsent: patch.smsConsent ?? previous?.smsConsent ?? false,
+      updatedAt: now,
+    };
+    this.userPhones.set(userId, row);
+    this.userIdsByPhone.set(phone, userId);
+    return clone(row);
+  }
+
+  async getUserPhone(userId: string): Promise<UserPhone | null> {
+    const row = this.userPhones.get(userId);
+    return row ? clone(row) : null;
+  }
+
+  async getUserPhoneByPhone(phone: string): Promise<UserPhone | null> {
+    const userId = this.userIdsByPhone.get(phone);
+    const row = userId ? this.userPhones.get(userId) : null;
+    return row ? clone(row) : null;
+  }
+
+  async updateUserPhone(userId: string, patch: Partial<Pick<UserPhone, 'phone' | 'verified' | 'smsConsent'>>): Promise<UserPhone> {
+    const current = this.userPhones.get(userId);
+    if (!current) throw new Error(`phone not found for user: ${userId}`);
+    if (patch.phone && patch.phone !== current.phone) {
+      const owner = this.userIdsByPhone.get(patch.phone);
+      if (owner && owner !== userId) throw new Error('phone_already_in_use');
+      this.userIdsByPhone.delete(current.phone);
+      this.userIdsByPhone.set(patch.phone, userId);
+    }
+    Object.assign(current, clone(patch), { updatedAt: new Date() });
+    return clone(current);
+  }
+
+  async countSmsSentToPhoneSince(phone: string, since: Date): Promise<number> {
+    return [...this.smsMessages.values()].filter((m) => m.phone === phone && m.sentAt && m.sentAt >= since && ['sent', 'delivered', 'failed'].includes(m.status)).length;
   }
 
   // --- Sayt murojaatlari va tokenlar ---------------------------------------
@@ -264,6 +332,89 @@ export class MemoryDatabase implements Database {
 
   async listEvents(userId: string, limit = 100): Promise<ConversationEvent[]> {
     return this.events.filter((e) => e.userId === userId).slice(-limit).map(clone);
+  }
+
+  async upsertStageProgress(userId: string, stageKey: string, stepOrder: number, enteredAt = new Date()): Promise<StageProgress> {
+    if (!this.users.has(userId)) throw new Error(`user not found: ${userId}`);
+    const key = `${userId}:${stageKey}`;
+    const current = this.stageProgress.get(key);
+    const row: StageProgress = current
+      ? { ...current, stepOrder }
+      : { id: nid('stage'), userId, stageKey, stepOrder, enteredAt, completedAt: null, exitReason: null };
+    this.stageProgress.set(key, row);
+    return clone(row);
+  }
+
+  async completeStageProgress(userId: string, stageKey: string, completedAt = new Date(), reason: StageProgress['exitReason'] = 'completed'): Promise<StageProgress | null> {
+    const key = `${userId}:${stageKey}`;
+    const current = this.stageProgress.get(key);
+    if (!current) return null;
+    current.completedAt = completedAt;
+    current.exitReason = reason;
+    return clone(current);
+  }
+
+  async listStageProgress(filter?: { userIds?: string[]; stageKey?: string; from?: Date; to?: Date; limit?: number }): Promise<StageProgress[]> {
+    let rows = [...this.stageProgress.values()];
+    if (filter?.userIds) {
+      const ids = new Set(filter.userIds);
+      rows = rows.filter((r) => ids.has(r.userId));
+    }
+    if (filter?.stageKey) rows = rows.filter((r) => r.stageKey === filter.stageKey);
+    if (filter?.from) rows = rows.filter((r) => r.enteredAt >= filter.from!);
+    if (filter?.to) rows = rows.filter((r) => r.enteredAt <= filter.to!);
+    return rows.sort((a, b) => a.stepOrder - b.stepOrder || a.enteredAt.getTime() - b.enteredAt.getTime()).slice(0, filter?.limit ?? 100000).map(clone);
+  }
+
+  async getStageFunnel(from: Date, to: Date, stuckAfterDays = 7): Promise<StageFunnelRow[]> {
+    const rows = [...this.stageProgress.values()].filter((p) => p.enteredAt >= from && p.enteredAt <= to);
+    const groups = new Map<string, StageProgress[]>();
+    for (const row of rows) groups.set(row.stageKey, [...(groups.get(row.stageKey) ?? []), row]);
+    const stuckCutoff = to.getTime() - stuckAfterDays * 86_400_000;
+    return [...groups.entries()].map(([stageKey, items]) => {
+      const viewed = new Set(items.map((r) => r.userId)).size;
+      const completedRows = items.filter((r) => r.completedAt !== null);
+      const completed = new Set(completedRows.map((r) => r.userId)).size;
+      const stuck = new Set(items.filter((r) => !r.completedAt && r.enteredAt.getTime() <= stuckCutoff).map((r) => r.userId)).size;
+      const durations = completedRows.map((r) => Math.max(0, (r.completedAt!.getTime() - r.enteredAt.getTime()) / 60_000)).sort((a, b) => a - b);
+      const middle = Math.floor(durations.length / 2);
+      const medianMinutes = durations.length === 0 ? null : durations.length % 2 ? durations[middle]! : (durations[middle - 1]! + durations[middle]!) / 2;
+      return { stageKey, stepOrder: Math.min(...items.map((r) => r.stepOrder)), viewed, completed, stuck, conversionPct: viewed ? Math.round((completed / viewed) * 10000) / 100 : 0, medianMinutes };
+    }).sort((a, b) => a.stepOrder - b.stepOrder || a.stageKey.localeCompare(b.stageKey));
+  }
+
+  async getStageFunnelSeries(from: Date, to: Date, by: 'day' | 'week'): Promise<StageFunnelPoint[]> {
+    const rows = [...this.stageProgress.values()].filter((p) => p.enteredAt >= from && p.enteredAt <= to);
+    const buckets = new Map<string, StageProgress[]>();
+    for (const row of rows) {
+      const dt = DateTime.fromJSDate(row.enteredAt, { zone: 'utc' });
+      const bucket = (by === 'week' ? dt.startOf('week') : dt.startOf('day')).toISODate()!;
+      buckets.set(`${bucket}:${row.stageKey}`, [...(buckets.get(`${bucket}:${row.stageKey}`) ?? []), row]);
+    }
+    const points: StageFunnelPoint[] = [];
+    for (const [key, items] of buckets) {
+      const [bucket, stageKey] = key.split(':');
+      const viewed = new Set(items.map((r) => r.userId)).size;
+      const completedRows = items.filter((r) => r.completedAt !== null);
+      const completed = new Set(completedRows.map((r) => r.userId)).size;
+      const durations = completedRows.map((r) => (r.completedAt!.getTime() - r.enteredAt.getTime()) / 60_000).sort((a, b) => a - b);
+      const mid = Math.floor(durations.length / 2);
+      points.push({ bucket: bucket!, stageKey: stageKey!, stepOrder: Math.min(...items.map((r) => r.stepOrder)), viewed, completed, stuck: 0, conversionPct: viewed ? Math.round((completed / viewed) * 10000) / 100 : 0, medianMinutes: durations.length ? (durations.length % 2 ? durations[mid]! : (durations[mid - 1]! + durations[mid]!) / 2) : null });
+    }
+    return points.sort((a, b) => a.bucket.localeCompare(b.bucket) || a.stepOrder - b.stepOrder);
+  }
+
+  async getRetentionCohorts(from: Date, to: Date): Promise<RetentionCohort[]> {
+    const cohorts = new Map<string, TelegramUser[]>();
+    for (const user of this.users.values()) {
+      if (user.createdAt < from || user.createdAt > to) continue;
+      const bucket = DateTime.fromJSDate(user.createdAt, { zone: 'utc' }).startOf('week').toISODate()!;
+      cohorts.set(bucket, [...(cohorts.get(bucket) ?? []), user]);
+    }
+    return [...cohorts.entries()].map(([bucket, users]) => {
+      const activeAt = (days: number) => users.filter((u) => u.lastSeenAt && u.lastSeenAt.getTime() >= u.createdAt.getTime() + days * 86_400_000 && u.lastSeenAt <= to).length;
+      return { bucket, users: users.length, d1: activeAt(1), d7: activeAt(7), d30: activeAt(30) };
+    }).sort((a, b) => a.bucket.localeCompare(b.bucket));
   }
 
   // --- Roziliklar -----------------------------------------------------------
@@ -669,10 +820,165 @@ export class MemoryDatabase implements Database {
     return [...this.admins.values()].map(clone);
   }
 
+  // --- Segmentlar / kampaniyalar / SMS -------------------------------------
+
+  private campaignRecipient(user: TelegramUser): CampaignRecipient {
+    const leadStatuses = [...this.salesLeads.values()].filter((l) => l.userId === user.id).map((l) => l.status);
+    return {
+      user: clone(user),
+      state: this.states.has(user.id) ? clone(this.states.get(user.id)!) : null,
+      phone: this.userPhones.has(user.id) ? clone(this.userPhones.get(user.id)!) : null,
+    };
+  }
+
+  private matchesUserSegment(user: TelegramUser, filters: SegmentFilters, channel: CampaignChannel, now = new Date()): boolean {
+    const activeConsent = this.consents.some((c) => c.userId === user.id && c.type === 'marketing' && !c.revokedAt);
+    const activeSmsConsent = this.consents.some((c) => c.userId === user.id && c.type === 'sms_marketing' && !c.revokedAt);
+    const leadStatuses = [...this.salesLeads.values()].filter((l) => l.userId === user.id).map((l) => l.status);
+    const viewedProductIds = this.productViews.filter((v) => v.userId === user.id).map((v) => v.productId);
+    const stageProgress = [...this.stageProgress.values()].filter((p) => p.userId === user.id);
+    return matchesSegment({
+      user,
+      state: this.states.get(user.id) ?? null,
+      stageProgress,
+      marketingConsent: activeConsent,
+      smsMarketingConsent: activeSmsConsent,
+      phone: this.userPhones.get(user.id) ?? null,
+      leadStatuses,
+      viewedProductIds,
+    }, filters, channel, now);
+  }
+
+  async previewSegment(filters: SegmentFilters, channel: CampaignChannel): Promise<{ count: number; sample: CampaignRecipient[] }> {
+    const matched = [...this.users.values()].filter((u) => this.matchesUserSegment(u, filters, channel));
+    return { count: matched.length, sample: matched.slice(0, 10).map((u) => this.campaignRecipient(u)) };
+  }
+
+  async listSegmentRecipients(filters: SegmentFilters, channel: CampaignChannel, campaignId: string, limit = 500): Promise<CampaignRecipient[]> {
+    const candidates = [...this.users.values()]
+      .filter((u) => this.matchesUserSegment(u, filters, channel))
+      .filter((u) => channel === 'telegram'
+        ? !this.outbox.some((m) => m.campaignId === campaignId && m.userId === u.id)
+        : ![...this.smsMessages.values()].some((m) => m.campaignId === campaignId && m.userId === u.id && !m.isTest))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, limit);
+    return candidates.map((u) => this.campaignRecipient(u));
+  }
+
+  async listSavedSegments(): Promise<SavedSegment[]> {
+    return [...this.savedSegments.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).map(clone);
+  }
+
+  async createSavedSegment(input: Omit<SavedSegment, 'id' | 'createdAt'>): Promise<SavedSegment> {
+    const row: SavedSegment = { ...clone(input), id: nid('segment'), createdAt: new Date() };
+    this.savedSegments.set(row.id, row);
+    return clone(row);
+  }
+
+  async deleteSavedSegment(id: string): Promise<boolean> {
+    return this.savedSegments.delete(id);
+  }
+
+  async createCampaign(input: Omit<Campaign, 'id' | 'startsAt' | 'endsAt' | 'statsCache' | 'createdAt' | 'updatedAt'>): Promise<Campaign> {
+    const now = new Date();
+    const row: Campaign = { ...clone(input), id: nid('campaign'), startsAt: null, endsAt: null, statsCache: null, createdAt: now, updatedAt: now };
+    this.campaigns.set(row.id, row);
+    return clone(row);
+  }
+
+  async getCampaign(id: string): Promise<Campaign | null> {
+    const row = this.campaigns.get(id);
+    return row ? clone(row) : null;
+  }
+
+  async listCampaigns(limit = 100): Promise<Campaign[]> {
+    return [...this.campaigns.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, limit).map(clone);
+  }
+
+  async updateCampaign(id: string, patch: Partial<Campaign>): Promise<Campaign> {
+    const row = this.campaigns.get(id);
+    if (!row) throw new Error(`campaign not found: ${id}`);
+    Object.assign(row, clone(patch), { updatedAt: new Date() });
+    return clone(row);
+  }
+
+  async getCampaignDeliverySummary(campaignId: string): Promise<CampaignDeliverySummary> {
+    const out = this.outbox.filter((m) => m.campaignId === campaignId);
+    const sms = [...this.smsMessages.values()].filter((m) => m.campaignId === campaignId && !m.isTest);
+    const all = [
+      ...out.map((m) => ({ status: m.status, reason: m.skippedReason ?? m.lastError })),
+      ...sms.map((m) => ({ status: m.status === 'queued' ? 'pending' : m.status, reason: m.skippedReason ?? m.lastError })),
+    ];
+    const skipped: Record<string, number> = {};
+    for (const row of all) {
+      if (row.status !== 'cancelled') continue;
+      const reason = row.reason?.replace(/^skipped:/, '').split(':')[0] || 'cancelled';
+      if (['consent', 'no_consent'].includes(reason)) skipped.consent = (skipped.consent ?? 0) + 1;
+      else if (['time', 'outside_window'].includes(reason)) skipped.time = (skipped.time ?? 0) + 1;
+      else if (reason === 'blocked') skipped.blocked = (skipped.blocked ?? 0) + 1;
+      else if (['no_phone', 'phone'].includes(reason)) skipped.no_phone = (skipped.no_phone ?? 0) + 1;
+      else if (reason !== 'cancelled') skipped[reason] = (skipped[reason] ?? 0) + 1;
+    }
+    return {
+      planned: all.length,
+      sent: all.filter((r) => ['sent', 'delivered'].includes(r.status)).length,
+      pending: all.filter((r) => ['pending', 'sending', 'queued'].includes(r.status)).length,
+      failed: all.filter((r) => r.status === 'failed').length,
+      skipped,
+    };
+  }
+
+  async createSmsMessage(input: Omit<SmsMessage, 'id' | 'attempts' | 'createdAt' | 'updatedAt'>): Promise<SmsMessage | null> {
+    if (!input.isTest && input.campaignId && input.userId && [...this.smsMessages.values()].some((m) => m.campaignId === input.campaignId && m.userId === input.userId && !m.isTest)) return null;
+    const now = new Date();
+    const row: SmsMessage = { ...clone(input), id: nid('sms'), attempts: 0, createdAt: now, updatedAt: now };
+    this.smsMessages.set(row.id, row);
+    return clone(row);
+  }
+
+  async getSmsMessage(id: string): Promise<SmsMessage | null> {
+    const row = this.smsMessages.get(id);
+    return row ? clone(row) : null;
+  }
+
+  async updateSmsMessage(id: string, patch: Partial<SmsMessage>): Promise<SmsMessage> {
+    const row = this.smsMessages.get(id);
+    if (!row) throw new Error(`sms message not found: ${id}`);
+    Object.assign(row, clone(patch), { updatedAt: new Date() });
+    return clone(row);
+  }
+
+  async listSmsMessages(filter?: { campaignId?: string; status?: SmsMessageStatus; limit?: number; offset?: number }): Promise<SmsMessage[]> {
+    let rows = [...this.smsMessages.values()];
+    if (filter?.campaignId) rows = rows.filter((m) => m.campaignId === filter.campaignId);
+    if (filter?.status) rows = rows.filter((m) => m.status === filter.status);
+    const offset = filter?.offset ?? 0;
+    return rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(offset, offset + (filter?.limit ?? 100)).map(clone);
+  }
+
+  async listAnalyticsEvents(filter?: { types?: string[]; typePrefix?: string; campaignId?: string; userIds?: string[]; from?: Date; to?: Date; limit?: number }): Promise<AnalyticsEvent[]> {
+    let rows = [...this.analytics];
+    if (filter?.types) rows = rows.filter((e) => filter.types!.includes(e.type));
+    if (filter?.typePrefix) rows = rows.filter((e) => e.type.startsWith(filter.typePrefix!));
+    if (filter?.campaignId) rows = rows.filter((e) => e.properties?.campaignId === filter.campaignId);
+    if (filter?.userIds) {
+      const ids = new Set(filter.userIds);
+      rows = rows.filter((e) => e.userId && ids.has(e.userId));
+    }
+    if (filter?.from) rows = rows.filter((e) => e.createdAt >= filter.from!);
+    if (filter?.to) rows = rows.filter((e) => e.createdAt <= filter.to!);
+    return rows.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).slice(0, filter?.limit ?? 100000).map(clone);
+  }
+
+  async listConversationEventsForUsers(userIds: string[], from: Date, to: Date): Promise<ConversationEvent[]> {
+    const ids = new Set(userIds);
+    return this.events.filter((e) => ids.has(e.userId) && e.createdAt >= from && e.createdAt <= to).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).map(clone);
+  }
+
   // --- Outbox ---------------------------------------------------------------
 
   async enqueueOutbox(
-    msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt'>,
+    msg: Omit<OutboxMessage, 'id' | 'status' | 'attempts' | 'nextAttemptAt' | 'lastError' | 'sentAt' | 'createdAt' | 'campaignId' | 'skippedReason'> & { campaignId?: string | null; skippedReason?: string | null },
   ): Promise<OutboxMessage | null> {
     if (this.outbox.some((m) => m.dedupeKey === msg.dedupeKey)) return null; // idempotent
     const m: OutboxMessage = {
@@ -681,6 +987,8 @@ export class MemoryDatabase implements Database {
       type: msg.type,
       dedupeKey: msg.dedupeKey,
       payload: msg.payload,
+      campaignId: msg.campaignId ?? null,
+      skippedReason: msg.skippedReason ?? null,
       scheduledFor: msg.scheduledFor,
       status: 'pending',
       attempts: 0,
@@ -725,11 +1033,13 @@ export class MemoryDatabase implements Database {
     ).length;
   }
 
-  async listOutbox(filter?: { userId?: string; status?: string; limit?: number }): Promise<OutboxMessage[]> {
+  async listOutbox(filter?: { userId?: string; status?: string; campaignId?: string; limit?: number; offset?: number }): Promise<OutboxMessage[]> {
     let list = [...this.outbox];
     if (filter?.userId) list = list.filter((m) => m.userId === filter.userId);
     if (filter?.status) list = list.filter((m) => m.status === filter.status);
-    return list.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(0, filter?.limit ?? 100).map(clone);
+    if (filter?.campaignId) list = list.filter((m) => m.campaignId === filter.campaignId);
+    const offset = filter?.offset ?? 0;
+    return list.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(offset, offset + (filter?.limit ?? 100)).map(clone);
   }
 
   // --- Tahlil ---------------------------------------------------------------

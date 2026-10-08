@@ -1,11 +1,11 @@
 # ============================================================================
 # Fly.io - admin panel (Next.js standalone, alohida app).
-# Panel /api/* so'rovlarini ichki tarmoq orqali asosiy app'ga proksi qiladi
-# (API_INTERNAL_URL) - shuning uchun brauzer CORS'ini sozlash shart emas,
+# Panel /api/* so'rovlarini next.config.mjs'da yozilgan API manziliga proksi qiladi
+# (build-time rewrite); shuning uchun brauzer CORS'ini sozlash shart emas,
 # cookie'lar same-origin yuboriladi.
 #
 #   fly apps create moyskladoy-admin
-#   fly deploy --config deploy/fly/fly.admin.toml
+#   fly deploy --config fly.admin.toml
 # ============================================================================
 app = "moyskladoy-admin"
 primary_region = "sin"
@@ -13,9 +13,8 @@ primary_region = "sin"
 [build]
 dockerfile = "apps/admin/Dockerfile"
 
-[env]
-# moyskladoy - fly.web.toml'dagi asosiy app nomi; .internal - Fly private networking.
-API_INTERNAL_URL = "https://moyskladoy.fly.dev"
+# API manzili next.config.mjs'da build vaqtida yoziladi (standart: https://moyskladoy.fly.dev).
+# Fly runtime [env] orqali bu rewrite manzilini o'zgartirib bo'lmaydi.
 
 [http_service]
 internal_port = 3000
