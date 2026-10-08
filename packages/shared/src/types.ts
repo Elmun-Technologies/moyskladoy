@@ -5,38 +5,41 @@
 /** Suhbat bosqichlari (state machine). */
 export type Stage =
   | 'START'
-  | 'INTRO_VIDEO'
   | 'EXPERIENCE_VIDEO'
   | 'CLIENT_REVIEW'
   | 'METHOD_VIDEO'
   | 'SURVEY_ROLE'
+  | 'SURVEY_ROLE_TEXT'
   | 'SURVEY_PROBLEM'
+  | 'SURVEY_PROBLEM_TEXT'
   | 'SURVEY_PATH'
   | 'BUSINESS_TYPE'
   | 'PATH_SELF'
   | 'PATH_EMPLOYEE'
   | 'PATH_UNSURE'
   | 'LESSON_INTRO'
-  | 'LESSON_OFFER'
   | 'TASK'
-  | 'TASK_RESULT'
-  | 'AFTER_TASK'
+  | 'TASK_CORRECT'
+  | 'TASK_WRONG'
+  | 'AFTER_LESSON_VIDEO'
   | 'STUDENT_REVIEW'
-  | 'NEED_CHECK'
+  | 'CONSENT_REMINDERS'
   | 'OFFERS'
   | 'OFFER_COURSE'
   | 'OFFER_VIDEOS'
   | 'OFFER_SERVICE'
   | 'COMPARE'
-  | 'OBJECTION'
   | 'OBJECTION_TIME'
-  | 'OBJECTION_PRICE'
   | 'OBJECTION_EMPLOYEE'
+  | 'OBJECTION_PRICE'
   | 'OBJECTION_START'
+  | 'ASK_QUESTION'
+  | 'ANSWER_FOLLOWUP'
   | 'READINESS'
   | 'TIMELINE'
   | 'DECISION_MAKER'
-  | 'DECISION_MAKER_LEADER'
+  | 'DECISION_LEADER'
+  | 'PREFLIGHT_VIDEO'
   | 'CONSENT_CONTACT'
   | 'CONTACT_METHOD'
   | 'PREFERRED_TIME'
@@ -44,10 +47,11 @@ export type Stage =
   | 'SUBMITTED'
   | 'NOT_READY'
   | 'MENU'
-  | 'ASK_QUESTION'
-  | 'NOTIFICATIONS'
+  | 'NOTIF_SETTINGS'
+  | 'REMINDERS_OFF'
   | 'TECH_HELP'
-  | 'UNKNOWN';
+  | 'UNKNOWN'
+  | 'PURCHASE_START';
 
 export type SalesStatus =
   | 'none' // sotuvga o'tmagan
@@ -89,6 +93,10 @@ export interface ShowCondition {
   onlyStages?: Stage[];
 /** Javob maydoni - question berkitilmasa blok ko'rsatilmaydi */
   requiresAnswer?: string;
+  /** Settings'da shu kalitlar to'ldirilgan bo'lishi shart - bo'lmasa bo'lim ishga tushmaydi */
+  requiredSettings?: string[];
+  /** Marketing roziligi bo'lsa bu bosqich o'tkaziladi (18-qoida: so'ralgan bo'lsa qayta so'rolmaydi) */
+  skipIfMarketingConsent?: boolean;
 }
 
 export interface ContentBlock {
@@ -104,6 +112,8 @@ export interface ContentBlock {
   mediaId: string | null;
   mediaSourceUrl: string | null;
   buttons: ButtonDef[];
+  /** Kamera uchun tayyor matn (video skripti) - bot uni yubormaydi, faqat panel. */
+  videoScript?: string | null;
   showCondition: ShowCondition | null;
   status: BlockStatus;
 /** Agar media bo'lmasa - faqat matn yuborish mumkinmi */

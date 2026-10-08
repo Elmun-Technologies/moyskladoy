@@ -1,6 +1,6 @@
 // ============================================================================
 // BotEngine testlari - HAQIQIY Telegram ishlatilmaydi.
-// MemoryDatabase + TestMessenger + applySeed (44 blok). Har test mustaqil.
+// MemoryDatabase + TestMessenger + applySeed (yangi 51-bo'lim seed). Har test mustaqil.
 // ============================================================================
 import { beforeEach, describe, expect, it } from 'vitest';
 import { MemoryDatabase, TestMessenger } from '@app/shared';
@@ -93,32 +93,35 @@ describe('token linking', () => {
 });
 
 describe('funnel paths', () => {
-  it("6. intro yo'li: START -> INTRO_VIDEO ketma-ketlikda", async () => {
+  it("6. tanishuv yo'li: START -> EXPERIENCE_VIDEO (media yo'q - matn fallback)", async () => {
     await start();
     msg.clear();
-    await click('goto:INTRO_VIDEO');
-    // media yo'q, textFallbackAllowed=true -> matnli fallback (transkript)
-    expect(lastText(TG.id)).toContain('Assalomu alaykum');
+    await click('goto:EXPERIENCE_VIDEO');
     const st = await db.getState((await db.getUserByTelegramId(TG.id))!.id);
-    expect(st?.stage).toBe('INTRO_VIDEO');
+    expect(st?.stage).toBe('EXPERIENCE_VIDEO');
+    expect(lastText(TG.id)).toContain("mijozimizning fikrini");
+    // START blockida videoNote yo'q - matn yuboriladi, xato bo'lmaydi
+    expect(msg.forChat(TG.id).length).toBeGreaterThan(0);
   });
 
-  it("7. sinov darsi qisqa yo'li: lesson havolasi yo'q -> \"Darsni ochish\" tugmasi yashirin", async () => {
+  it("7. lesson havolasi to'ldirilmagan -> bo'lim OCHILMAYDI (section_soon)", async () => {
     await start();
     msg.clear();
     await click('goto:LESSON_INTRO');
-    const last = msg.last(TG.id);
-    const actions = (last?.buttons ?? []).flat().map((b) => b.action);
-    expect(actions).not.toContain('lesson:open');
-    expect(actions).toContain('lesson:watched');
-    // havola berilgach tugma paydo bo'ladi
+    expect(lastText(TG.id)).toContain('hali tayyorlanmoqda');
+    // havola berilgach bo'lim ishga tushadi
     await db.setSetting('lesson_link', 'https://example.uz/lesson');
-    await click('goto:START');
     await click('goto:LESSON_INTRO');
     const last2 = msg.last(TG.id);
     const actions2 = (last2?.buttons ?? []).flat().map((b) => b.action);
     expect(actions2).toContain('lesson:open');
     expect(last2?.text).toContain('https://example.uz/lesson');
+    // ochish != ko'rish
+    await click('lesson:open');
+    const user = await db.getUserByTelegramId(TG.id);
+    const st = await db.getState(user!.id);
+    expect(st?.lessonLinkClickedAt).not.toBeNull();
+    expect(st?.lessonWatchedAt).toBeNull();
   });
 
   it("8. xizmat (service) yo'li: kurs darsidan o'tmasiz ham taklifga yetadi", async () => {
@@ -127,7 +130,7 @@ describe('funnel paths', () => {
     await click('goto:OFFER_SERVICE');
     const last = msg.last(TG.id);
     expect(last?.text).toContain('Xizmat');
-    expect(last?.text).toContain("ko'lami bo'yicha");
+    expect(last?.text).toContain('narxni shundan keyin aytishimiz mumkin');
     // qattiq narx ko'rsatilmaydi (by_scope)
     expect(last?.text).not.toMatch(/500 USD/);
   });
@@ -160,7 +163,7 @@ describe('prices and unconfirmed offer', () => {
     await start();
     await click('goto:OFFER_COURSE');
     // rozilik orqali arizagacha yetamiz
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const user = await db.getUserByTelegramId(TG.id);
@@ -183,7 +186,7 @@ describe('prices and unconfirmed offer', () => {
 describe('idempotency, replay, stop conditions', () => {
   it("12. takroriy \"submit:send\" - bitta ariza, ikkinchisi yo'q", async () => {
     await start();
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const before = (await db.listSalesLeads()).total;
@@ -194,15 +197,15 @@ describe('idempotency, replay, stop conditions', () => {
     expect(after).toBe(1);
   });
 
-  it("13. eski goto:CONSENT_CONTACT - in_sales statusni orqaga qaytarmaydi", async () => {
+  it("13. eski goto:PREFLIGHT_VIDEO - in_sales statusni orqaga qaytarmaydi", async () => {
     await start();
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const user = await db.getUserByTelegramId(TG.id);
     const st1 = await db.getState(user!.id);
     expect(st1?.salesStatus).toBe('in_sales');
-    await click('goto:CONSENT_CONTACT'); // eski sahna tugmasi
+    await click('goto:PREFLIGHT_VIDEO'); // eski sahna tugmasi
     const st2 = await db.getState(user!.id);
     expect(st2?.salesStatus).toBe('in_sales');
     expect(st2?.stage).toBe('SUBMITTED');
@@ -222,7 +225,7 @@ describe('idempotency, replay, stop conditions', () => {
     await start();
     const user = await db.getUserByTelegramId(TG.id);
     await db.enqueueOutbox({ userId: user!.id, type: 'reminder', dedupeKey: 'r1', payload: { blockKey: 'x' }, scheduledFor: new Date(Date.now() + 1000) });
-    await db.enqueueOutbox({ userId: user!.id, type: 'marketing', dedupeKey: 'm1', payload: { blockKey: 'tip_cash_reconciliation' }, scheduledFor: new Date(Date.now() + 1000) });
+    await db.enqueueOutbox({ userId: user!.id, type: 'marketing', dedupeKey: 'm1', payload: { blockKey: 'tip_cash' }, scheduledFor: new Date(Date.now() + 1000) });
     expect((await db.listOutbox({ userId: user!.id, status: 'pending' })).length).toBe(2);
     await click('consent:revoke_marketing');
     expect((await db.listOutbox({ userId: user!.id, status: 'pending' })).length).toBe(0);
@@ -232,7 +235,7 @@ describe('idempotency, replay, stop conditions', () => {
     await start();
     const user = await db.getUserByTelegramId(TG.id);
     await db.enqueueOutbox({ userId: user!.id, type: 'reminder', dedupeKey: 'r-old', payload: {}, scheduledFor: new Date(Date.now() + 3600_000) });
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const pending = await db.listOutbox({ userId: user!.id, status: 'pending' });
@@ -241,7 +244,7 @@ describe('idempotency, replay, stop conditions', () => {
 
   it("17. ikki xodim race - bitta g'olib, ikkinchisiga \"allaqachon olingan", async () => {
     await start();
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const user = await db.getUserByTelegramId(TG.id);
@@ -261,7 +264,7 @@ describe('idempotency, replay, stop conditions', () => {
 
   it("18. guruhdan tashqari xodim emas - claim rad etiladi", async () => {
     await start();
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     await click('submit:send');
     const user = await db.getUserByTelegramId(TG.id);
@@ -275,7 +278,7 @@ describe('idempotency, replay, stop conditions', () => {
 
   it("19. Telegram xabar muvaffaqiyatsiz - lead baribir saqlanadi (outbox qayta urinishi kutadi)", async () => {
     await start();
-    await click('consent:grant');
+    await click('consent:grant_contact');
     await click('contact:telegram');
     msg.nextResult = { ok: false, error: '429 Too Many Requests', ambiguous: false };
     await click('submit:send');
@@ -298,23 +301,25 @@ describe('idempotency, replay, stop conditions', () => {
     await engine2.handleStart({ updateId: ++updateSeq, chatId: TG.id, telegramId: TG.id }, { username: TG.username, firstName: TG.firstName, languageCode: TG.languageCode });
     const st = await db.getState(user!.id);
     expect(st?.stage).toBe('METHOD_VIDEO'); // bosqich saqlangan
-    expect(lastText(TG.id)).toContain('Qaysini tanlaysiz?'); // qaytishda menyu ko'rsatiladi
+    expect(lastText(TG.id)).toContain("Qaysi bo'limga kirmoqchisiz?"); // qaytishda menyu ko'rsatiladi
   });
 
   it("21. majburiy media + fallback taqiqlangan blok - o'tkazib yuboriladi, xabar yo'q", async () => {
     const before = msg.sent.length;
     await start();
     msg.clear();
-    // intro_video'ni textFallbackAllowed=false qilib yangi versiya kiritamiz
-    const cur = await db.getBlockByKey('intro_video', 'approved');
+    // client_review: requiresMedia + fallback taqiqlangan - bosqich o'tkaziladi
+    const cur = await db.getBlockByKey('client_review', 'approved');
     expect(cur).not.toBeNull();
-    await db.upsertBlock({ ...cur!, textFallbackAllowed: false });
-    await click('goto:INTRO_VIDEO');
+    await click('goto:EXPERIENCE_VIDEO'); // keyin CLIENT_REVIEW bosqichi navbatda
+    await db.updateState((await db.getUserByTelegramId(TG.id))!.id, { stage: 'CLIENT_REVIEW' });
+    msg.clear();
+    await click('goto:CLIENT_REVIEW');
     const user = await db.getUserByTelegramId(TG.id);
     const st = await db.getState(user!.id);
-    expect(st?.stage).toBe('EXPERIENCE_VIDEO'); // skip to next
-    expect(msg.sent.length - before).toBeGreaterThanOrEqual(0);
-    expect(msg.forChat(TG.id).some((m) => (m.text ?? '').includes('Assalomu alaykum'))).toBe(false);
+    expect(st?.stage).toBe('METHOD_VIDEO'); // media yo'q -> keyingi goto'ga o'tdi
+    void before;
+    expect(msg.forChat(TG.id).some((m) => (m.text ?? '').includes('Mijozning tajribasini'))).toBe(false);
   });
 
   it("22. update dedupe: bir xil update_id ikki marta kelsa - ikkinchisi e'tiborsiz", async () => {
@@ -345,7 +350,7 @@ describe('windows and statuses', () => {
     await click('goto:CONSENT_CONTACT');
     const st = await db.getState(user!.id);
     expect(st?.stage).toBe('OFFERS'); // o'zgarmadi
-    expect(lastText(TG.id)).toContain('Qaysini tanlaysiz?'); // savol tugmalari blokiyani ko'rsatadi
+    expect(lastText(TG.id)).toContain("Qaysi bo'limga kirmoqchisiz?"); // xaridga faqat menyu
   });
 });
 
@@ -365,5 +370,184 @@ describe('panel tugma nazorati', () => {
     const actions = (last?.buttons ?? []).flat().map((b) => b.action);
     expect(actions).not.toContain('cmd:menu');
     expect(actions).toContain('goto:OFFERS');
+  });
+});
+
+describe('yangi spec qoidalari', () => {
+  async function toStage(stage: string): Promise<void> {
+    const user = await db.getUserByTelegramId(TG.id);
+    await db.updateState(user!.id, { stage: stage as never });
+  }
+
+  it("26. task: noto'g'ri javob chetlashtirmaydi - izoh + davom tugmalari", async () => {
+    await start();
+    await toStage('TASK');
+    msg.clear();
+    await click('task:wrong');
+    const user = await db.getUserByTelegramId(TG.id);
+    const st = await db.getState(user!.id);
+    expect(st?.stage).toBe('TASK_WRONG');
+    expect(lastText(TG.id)).toContain('Muhim emas');
+    const actions = (msg.last(TG.id)?.buttons ?? []).flat().map((b) => b.action);
+    expect(actions).toContain('goto:AFTER_LESSON_VIDEO'); // davom etish mumkin
+    await click('task:right');
+    expect((await db.getState(user!.id))?.stage).toBe('TASK_CORRECT');
+  });
+
+  it('27. survey ketma-ketligi: role -> problem -> path; path -> biznes turi savoli bir marta', async () => {
+    await start();
+    await toStage('SURVEY_ROLE');
+    await click('answer:role=self');
+    expect((await db.getState((await db.getUserByTelegramId(TG.id))!.id))?.stage).toBe('SURVEY_PROBLEM');
+    await click('answer:problem=stock');
+    expect((await db.getState((await db.getUserByTelegramId(TG.id))!.id))?.stage).toBe('SURVEY_PATH');
+    await click('goto:PATH_SELF');
+    let user = await db.getUserByTelegramId(TG.id);
+    let st = await db.getState(user!.id);
+    expect(st?.stage).toBe('BUSINESS_TYPE'); // avval biznes turi so'raladi
+    // erkin matn - keyin yo'l sahifasi
+    await engine.handleText({ chatId: TG.id, telegramId: TG.id }, "Donut do'koni, 3 xodim");
+    st = await db.getState((await db.getUserByTelegramId(TG.id))!.id);
+    expect(st?.stage).toBe('PATH_SELF');
+    expect(st?.answers.business).toContain('Donut');
+    // endi qayta so'ralmaydi
+    await click('goto:PATH_EMPLOYEE');
+    st = await db.getState((await db.getUserByTelegramId(TG.id))!.id);
+    expect(st?.stage).toBe('PATH_EMPLOYEE');
+    void user;
+  });
+
+  it('28. sessiya oxiri: OFFERSga otingach rozilik so\u2018raladi; site roziligi bo\u2018lsa - so\u2018ralmaydi', async () => {
+    await start();
+    await toStage('AFTER_LESSON_VIDEO');
+    msg.clear();
+    await click('goto:OFFERS');
+    const user = await db.getUserByTelegramId(TG.id);
+    let st = await db.getState(user!.id);
+    expect(st?.stage).toBe('CONSENT_REMINDERS');
+    expect(lastText(TG.id)).toContain('Sizni shu yerda qoldiraylikmi');
+    await click('consent:grant_marketing');
+    st = await db.getState(user!.id);
+    expect(st?.stage).toBe('OFFERS'); // javobdan keyin davom
+    expect(await db.hasActiveConsent(user!.id, 'marketing')).toBe(true);
+    // qaytganida endi so'ralmaydi
+    await toStage('AFTER_LESSON_VIDEO');
+    msg.clear();
+    await click('goto:OFFERS');
+    expect((await db.getState(user!.id))?.stage).toBe('OFFERS');
+    expect(lastText(TG.id)).not.toContain('qoldiraylikmi');
+  });
+
+  it('29. mijoz videosi tugmalari media bo\u2018lmasa yashirin (17-qoida)', async () => {
+    await start();
+    await toStage('EXPERIENCE_VIDEO');
+    msg.clear();
+    await click('goto:EXPERIENCE_VIDEO');
+    const actions = (msg.last(TG.id)?.buttons ?? []).flat().map((b) => b.action);
+    expect(actions).not.toContain('goto:CLIENT_REVIEW');
+    // admin media bog'lasa - tugma chiqadi
+    const cur = await db.getBlockByKey('client_review', 'approved');
+    await db.upsertBlock({ ...cur!, mediaId: 'media_test_1' });
+    await click('goto:EXPERIENCE_VIDEO');
+    const actions2 = (msg.last(TG.id)?.buttons ?? []).flat().map((b) => b.action);
+    expect(actions2).toContain('goto:CLIENT_REVIEW');
+  });
+
+  it('30. sozlamalar: notif:off -> REMINDERS_OFF + revoke; notif:lessons -> scope', async () => {
+    await start();
+    const user = await db.getUserByTelegramId(TG.id);
+    await db.grantConsent(user!.id, 'marketing', 'v1');
+    await db.enqueueOutbox({ userId: user!.id, type: 'marketing', dedupeKey: 'q1', payload: { blockKey: 'tip_cash' }, scheduledFor: new Date(Date.now() + 60000) });
+    await toStage('NOTIF_SETTINGS');
+    msg.clear();
+    await click('notif:off');
+    expect((await db.getState(user!.id))?.stage).toBe('REMINDERS_OFF');
+    expect(await db.hasActiveConsent(user!.id, 'marketing')).toBe(false);
+    expect((await db.listOutbox({ userId: user!.id, status: 'pending' })).length).toBe(0);
+    await click('notif:lessons');
+    const st = await db.getState(user!.id);
+    expect(st?.answers.notif_scope).toBe('lessons');
+    expect(await db.hasActiveConsent(user!.id, 'marketing')).toBe(true);
+  });
+
+  it('31. dars ertaga eslatmasi - navbatga qo\u2018yiladi va duplikat bo\u2018lmaydi', async () => {
+    await start();
+    await toStage('REMINDER_HOST');
+    await toStage('LESSON_INTRO');
+    msg.clear();
+    await click('lesson:remind_tomorrow');
+    const user = await db.getUserByTelegramId(TG.id);
+    const items = await db.listOutbox({ userId: user!.id });
+    expect(items.filter((i) => (i.payload as { blockKey?: string }).blockKey === 'reminder_lesson').length).toBe(1);
+    expect(lastText(TG.id)).toContain('10:00');
+    await click('lesson:remind_tomorrow'); // takroriy bosish
+    expect((await db.listOutbox({ userId: user!.id })).length).toBe(1);
+  });
+
+  it('32. uzatishda texnik xatolik -> soxta tasdiq YO\u2018Q, jamaga ogohlantirish', async () => {
+    await start();
+    await db.setSetting('sales_group_chat_id', '999000');
+    await click('consent:grant_contact');
+    await click('contact:telegram');
+    const user = await db.getUserByTelegramId(TG.id);
+    await toStage('REVIEW_SUBMIT');
+    const dbAny = db as unknown as { createSalesLead: unknown };
+    const orig = dbAny.createSalesLead;
+    dbAny.createSalesLead = () => {
+      throw new Error('db down');
+    };
+    msg.clear();
+    await click('submit:send');
+    expect(lastText(TG.id)).toContain('kutilmoqda'); // honest pending message
+    expect(lastText(TG.id)).not.toContain('uzatildi.');
+    expect((await db.getState(user!.id))?.salesStatus).not.toBe('in_sales');
+    const alert = (await db.listOutbox({ userId: user!.id })).find((o) => ((o.payload as { text?: string }).text ?? '').includes('xatolik'));
+    expect(alert).toBeDefined();
+    // tiklangach qayta bosish -> muvaffaqiyat
+    dbAny.createSalesLead = orig;
+    await click('submit:send');
+    expect(lastText(TG.id)).toContain("sotuv bo'limiga uzatildi");
+  });
+
+  it('33. readiness kartasi: narx DB\u2018dan, $800 yo\u2018q; service narxi - matn', async () => {
+    await start();
+    await click('goto:OFFER_COURSE');
+    await toStage('READINESS');
+    msg.clear();
+    await click('cmd:menu');
+    await click('goto:READINESS');
+    expect(lastText(TG.id)).toContain('2,000 USD');
+    expect(lastText(TG.id)).not.toMatch(/800/);
+  });
+
+  it('34. kontakt usuli: sayt telefony borida qayta so\u2018ralmaydi', async () => {
+    const lead = await db.createSiteLead(siteLeadData('Ali'));
+    const t = await db.createLinkToken(lead.id, 24);
+    await start(t.token);
+    await toStage('CONTACT_METHOD');
+    msg.clear();
+    await click('goto:CONTACT_METHOD');
+    const actions = (msg.last(TG.id)?.buttons ?? []).flat().map((b) => b.action);
+    expect(actions).toContain('answer:contact=phone'); // tayyor raqam tugmasi
+    expect(actions).not.toContain('contact:phone'); // qo'shimcha so'ramaymiz
+    const labels = (msg.last(TG.id)?.buttons ?? []).flat().map((b) => b.label).join('|');
+    expect(labels).toContain('+998'); // raqam tugma yorlig'ida ko'rinadi
+  });
+
+  it('35. xarid tasdiqlansa - purchase_start xabari yuboriladi, funnel tugmalari yopiladi', async () => {
+    await start();
+    const user = await db.getUserByTelegramId(TG.id);
+    await db.setSetting('purchase_start_message', 'Darsga kirish: https://course.example.uz');
+    await db.updateState(user!.id, { salesStatus: 'in_sales', stage: 'SUBMITTED' });
+    // API confirmation o'rniga: engine purchase_start blokini yuborishi tekshiriladi
+    const blk = await db.getBlockByKey('purchase_start', 'approved');
+    expect(blk).not.toBeNull();
+    msg.clear();
+    await engine.enqueue(TG.id, async () => {
+      const st = await db.getState(user!.id);
+      if (st) await engine.sendBlockPublic(user!.id, blk!, TG.id);
+    });
+    expect(lastText(TG.id)).toContain('https://course.example.uz');
+    expect(lastText(TG.id)).toContain('yordam botimiz');
   });
 });

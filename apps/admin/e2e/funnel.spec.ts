@@ -11,18 +11,19 @@ test('sayt formasi -> t.me linki -> bot demo funnel -> ariza', async ({ page }) 
   await page.click('button[type=submit]');
   const out = page.locator('#out');
   await expect(out).toContainText('https://t.me/', { timeout: 8000 });
-  // Bot simulator: start -> davom -> sinov darsi yo'li -> savol -> taklif -> rozilik -> yuborish
+  // Bot simulator: start -> sinov darsi yo'li -> taklif -> sessiya oxiri roziligi -> yuborish
   await page.fill('#tg', String(TG));
   await page.click('#rst');
   await expect(page.locator('#log')).toContainText('Xush kelibsiz');
-  for (const action of ['goto:LESSON_INTRO', 'lesson:watched', 'goto:NEED_CHECK', 'goto:OFFERS', 'goto:OFFER_COURSE', 'goto:READINESS', 'consent:grant', 'contact:telegram', 'submit:send']) {
+  const actions = ['goto:LESSON_INTRO', 'lesson:watched', 'task:right', 'goto:AFTER_LESSON_VIDEO', 'goto:OFFERS', 'consent:grant_marketing', 'goto:OFFER_COURSE', 'goto:READINESS', 'consent:grant_contact', 'contact:telegram', 'submit:send'];
+  for (const action of actions) {
     await page.evaluate(async (data) => {
       await fetch('/api/bot/simulate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ telegramId: TG, data }) });
     }, action);
   }
   await page.click('#rst'); // menyu orqali oxirgi xabarlarni ko'rish
   const txt = await page.locator('#log').innerText();
-  expect(txt).toContain('Arizangiz qabul qilindi');
+  expect(txt).toContain("sotuv bo'limiga uzatildi");
 });
 
 test('admin panel: kirish -> statistika', async ({ page }) => {

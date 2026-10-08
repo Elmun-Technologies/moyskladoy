@@ -190,6 +190,7 @@ model ContentBlock {
   mediaId             String?
   mediaSourceUrl      String?
   buttons             Json     @default("[]")
+  videoScript       String?
   showCondition       Json?
   status              String   @default("draft") // draft | approved
   textFallbackAllowed Boolean  @default(true)

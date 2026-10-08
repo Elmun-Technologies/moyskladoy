@@ -7,9 +7,18 @@ Yulduzcha (*) - bularchsiz lokal ishlaydi, lekin prod uchun shart.
 3. * Sotuv guruhi: guruhga botni qo'shish, chat_id (`SALES_GROUP_CHAT_ID`),
    xodimlarning Telegram ID ro'yxati (`SALES_STAFF_TELEGRAM_IDS`) va
    har biriga admin hisobi (email) + panel "sales" roli.
-4. * 3 ta video: tanishuv, tajriba, metod (round video_note formati tavsiya,
-   Bot API cheklovlari bilan - docs/CONTENT_CHECKLIST.md).
-5. * Sinov darsi havolasi (video/kurs platformasi) - Sozlamalar'ga.
+4. * 3 ta tanishuv videosi (welcome/experience/method bloklarining kamera matni
+   seed'da tayyor - docs/CONTENT_CHECKLIST.md) + ruxsat olingan mijoz videosi
+   (Nefrit) va kurs bitiruvchisi videosi. Bularchiz bo'limlar o'chib qolmaydi,
+   faqat video qismi yuborilmaydi yoki bosqich o'tkaziladi.
+5. * Sinov darsi: havola/video - Sozlamalar'ga (`lesson_link`). Shu kalit
+   to'ldirilgunicha dars bo'limi umuman ochilmaydi.
+5a. * Kurs va videodarslar SHARTLARI havolalari (`terms_course_url`,
+   `terms_videos_url`) + yordam boti manzili (`help_path`) - bracket
+   placeholder'lar; to'ldirilmasa tegishli bo'lim ishga tushmaydi.
+5b. * 28-34 bosqichlardagi "so'rab tekshiriladigan" atamalarni sotuv jamoasi
+   bilishi uchun qo'ng'iroq savollari ro'yxati (preflight video tamoyilan
+   yozib bo'lingan - ovoz/ko'rinish kerak).
 6. * $800 taklif: nomi, tarkibi, kimga qandaq ko'rsatilishi (tasdiqlangach
    panel'da yoqiladi).
 7. Kurs mahsuloti shartlari: davomiyligi, qo'llab-quvvatlash turi, kirish
@@ -20,7 +29,7 @@ Yulduzcha (*) - bularchsiz lokal ishlaydi, lekin prod uchun shart.
 9. Sayt formasi joyi: qaysi sahifaga qo'yiladi, UTM manbalar ro'yxati
    (reklama kampaniyalari nomlari) - statistika bo'limi uchun.
 10. Brend talablari: botning menyu tugmalari tartibi, ovozli videolardagi
-   matnlar (hozirgi 44 xabar - panel'dan to'liq tahrirlanadi).
+   matnlar (hozirgi 58 blok - panel'dan to'liq tahrirlanadi).
 11. Ma'lumotlar siyosati: saqlash muddati (`RETENTION_DAYS`), eksportga ruxsat
     beruvchi shaxs; O'zbekiston shaxsiy ma'lumotlar talablariga muvofiqlik.
 12. Server/infra: Docker compose'ni qayerda ishga tushiramiz (VPS), backup

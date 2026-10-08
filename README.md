@@ -2,16 +2,17 @@
 
 Jamshid (@ogriqqa_yechim) biznesi uchun: sayt -> Telegram bot -> funnell -> sotuv
 guruhiga ariza -> xodimning o'zlashtirishi -> nazorat qilingan eslatmalar.
-Kontent (44 xabar), mahsulot/narxlar, roziklar - hammasi ma'lumotlar bazasida,
+Kontent (58 blok - yangi 51 bo'limli spec matnlari), mahsulot/narxlar, roziklar -
+hammasi ma'lumotlar bazasida,
 admin panelidan tahrirlanadi. Bot matnlarida AI erkin javob YO'Q.
 
 ## Komponentlar
 
 | Qism | Texnologiya | Holat |
 |---|---|---|
-| `apps/bot` - funnel dvigateli | TypeScript + grammY | tayyor, 24 test o'tdi |
-| `apps/api` - sayt formasi + admin API | Fastify 5 + zod | tayyor, 12 test o'tdi |
-| `apps/worker` - eslatmalar/outbox | BullMQ yoki interval fallback | tayyor, 8 test o'tdi |
+| `apps/bot` - funnel dvigateli | TypeScript + grammY | tayyor, 35 test o'tdi |
+| `apps/api` - sayt formasi + admin API | Fastify 5 + zod | tayyor, 21 test o'tdi |
+| `apps/worker` - eslatmalar/outbox | BullMQ yoki interval fallback | tayyor, 11 test o'tdi |
 | `apps/admin` - boshqaruv paneli | Next.js 15 | tayyor (build OK, e2e yozilgan, browser yo'qligi sababli Ishga tushirilmagan) |
 | `packages/shared` - domen modeli | TypeScript | tayyor |
 | `packages/db` - Prisma + seed | Prisma 6 + PostgreSQL | tayyor (generate/migrate sizning mashinangizda) |

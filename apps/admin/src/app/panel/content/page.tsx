@@ -15,6 +15,15 @@ interface Block {
   requiresMedia: boolean;
   textFallbackAllowed: boolean;
   buttons: { label: string; action: string; hidden?: boolean }[];
+  videoScript?: string | null;
+  showCondition?: {
+    lessonLinkRequired?: boolean;
+    requiresVisibleProducts?: boolean;
+    requiresAnswer?: string;
+    skipIfMarketingConsent?: boolean;
+    requiredSettings?: string[];
+    onlyStages?: string[];
+  } | null;
 }
 interface MediaItem {
   id: string;
@@ -37,6 +46,7 @@ const ACTION_KINDS: [string, string][] = [
   ['consent', 'Rozilik'],
   ['contact', 'Kontakt'],
   ['submit', 'Aritiga yuborish'],
+  ['notif', 'Bildirishnoma sozlamasi'],
   ['cmd', 'Buyruq'],
 ];
 
@@ -53,6 +63,8 @@ export default function Content() {
   const [edit, setEdit] = useState<Block | null>(null);
   const [btns, setBtns] = useState<BtnDraft[]>([]);
   const [stageOptions, setStageOptions] = useState<string[]>([]);
+  const [cond, setCond] = useState<NonNullable<Block['showCondition']>>({});
+  const [settingsCsv, setSettingsCsv] = useState('');
   const [preview, setPreview] = useState<{ text: string; warning: string | null } | null>(null);
   const [note, setNote] = useState('');
   const [errors, setErrors] = useState<string[]>([]);
@@ -76,6 +88,8 @@ export default function Content() {
   function openEditor(b: Block) {
     setEdit({ ...b });
     setBtns((b.buttons ?? []).map((x) => ({ label: x.label, action: x.action, hidden: x.hidden === true })));
+    setCond(b.showCondition ?? {});
+    setSettingsCsv((b.showCondition?.requiredSettings ?? []).join(', '));
     setPreview(null);
     setErrors([]);
     setNote('');
@@ -104,7 +118,19 @@ export default function Content() {
         mediaId: edit.mediaId || null,
         requiresMedia: edit.requiresMedia,
         textFallbackAllowed: edit.textFallbackAllowed,
+        videoScript: edit.videoScript ?? null,
         buttons: btns,
+        showCondition: (() => {
+          const sc: Record<string, unknown> = {};
+          if (cond.lessonLinkRequired) sc.lessonLinkRequired = true;
+          if (cond.requiresVisibleProducts) sc.requiresVisibleProducts = true;
+          if (cond.skipIfMarketingConsent) sc.skipIfMarketingConsent = true;
+          if (cond.requiresAnswer) sc.requiresAnswer = cond.requiresAnswer;
+          if (cond.onlyStages?.length) sc.onlyStages = cond.onlyStages;
+          const rs = settingsCsv.split(',').map((x) => x.trim()).filter(Boolean);
+          if (rs.length) sc.requiredSettings = rs;
+          return Object.keys(sc).length > 0 ? sc : null;
+        })(),
       },
     });
     if (r.status === 422) {
@@ -194,6 +220,8 @@ export default function Content() {
           <input value={edit.title} onChange={(e) => setEdit({ ...edit, title: e.target.value })} />
           <label>Matn (bot yuboradigan xabar)</label>
           <textarea rows={6} value={edit.body} onChange={(e) => setEdit({ ...edit, body: e.target.value })} />
+          <label>Kamera matni (video skripti) - bot uni yubormaydi, faqat panelda saqlanadi</label>
+          <textarea rows={4} value={edit.videoScript ?? ''} onChange={(e) => setEdit({ ...edit, videoScript: e.target.value })} />
 
           <h2>Media turi</h2>
           <div className="row">
@@ -228,6 +256,24 @@ export default function Content() {
             Fayl yo&apos;qmi? <a href="/panel/media">Media bo&apos;limiga yuklang</a> - round video uchun mp4 60s gacha.
           </p>
 
+          <h2>Ko&apos;rsatish shartlari</h2>
+          <div className="row" style={{ flexWrap: 'wrap', gap: 10 }}>
+            <label className="row">
+              <input style={{ width: 16 }} type="checkbox" checked={cond.requiredSettings !== undefined || cond.lessonLinkRequired === true} onChange={() => undefined} disabled /> shart(alar) qo&apos;yilgan
+            </label>
+            <label className="row" title="Settings&apos;dagi kalitlar to&apos;ldirilmaguncha bo&apos;lim umuman ochilmaydi">
+              <input style={{ width: 16 }} type="checkbox" checked={(cond.requiredSettings?.length ?? 0) > 0} onChange={(e) => { if (!e.target.checked) setSettingsCsv(''); else if (!settingsCsv) setSettingsCsv('lesson_link'); }} /> settings kalitlari shart
+            </label>
+            <label className="row" title="Foydalanuvchida tasdiqlangan narxli mahsulot bo&apos;lmasa taklif tugmalari yashirin">
+              <input style={{ width: 16 }} type="checkbox" checked={cond.requiresVisibleProducts === true} onChange={(e) => setCond({ ...cond, requiresVisibleProducts: e.target.checked })} /> faqat tasdiqlangan takliflar bo&apos;lsa
+            </label>
+            <label className="row" title="Marketing roziligi allaqachon bo&apos;lsa bu bosqich o&apos;tkaziladi">
+              <input style={{ width: 16 }} type="checkbox" checked={cond.skipIfMarketingConsent === true} onChange={(e) => setCond({ ...cond, skipIfMarketingConsent: e.target.checked })} /> rozilik bo&apos;lsa o&apos;tkazilsin
+            </label>
+          </div>
+          <label>Settings kalitlari (vergul bilan) - qiymati to&apos;ldirilmagacha bo&apos;lim ishlamaydi</label>
+          <input value={settingsCsv} onChange={(e) => setSettingsCsv(e.target.value)} placeholder="lesson_link, terms_course_url, terms_videos_url" />
+
           <h2>Tugmalar ({btns.length}/12)</h2>
           {btns.map((x, i) => {
             const { kind, rest } = parseAction(x.action);
@@ -236,7 +282,7 @@ export default function Content() {
                 <input style={{ width: 170 }} placeholder="Tugma matni" value={x.label} onChange={(e) => setBtn(i, { label: e.target.value })} />
                 <select style={{ width: 150 }} value={kind} onChange={(e) => {
                   const k = e.target.value;
-                  const def = k === 'goto' ? 'goto:' + (stageOptions[0] ?? 'MENU') : k === 'answer' ? 'answer:role=owner' : k === 'task' ? 'task:a' : k === 'lesson' ? 'lesson:watched' : k === 'consent' ? 'consent:grant' : k === 'contact' ? 'contact:telegram' : k === 'submit' ? 'submit:send' : 'cmd:menu';
+                  const def = k === 'goto' ? 'goto:' + (stageOptions[0] ?? 'MENU') : k === 'answer' ? 'answer:role=self' : k === 'task' ? 'task:right' : k === 'lesson' ? 'lesson:watched' : k === 'consent' ? 'consent:grant_marketing' : k === 'contact' ? 'contact:telegram' : k === 'submit' ? 'submit:send' : k === 'notif' ? 'notif:marketing' : 'cmd:menu';
                   setBtn(i, { action: def });
                 }}>
                   {ACTION_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
@@ -246,7 +292,7 @@ export default function Content() {
                     {stageOptions.map((st) => <option key={st} value={st}>{st}</option>)}
                   </select>
                 ) : (
-                  <input style={{ width: 210 }} value={rest} onChange={(e) => setBtn(i, { action: kind + ':' + e.target.value })} placeholder={kind === 'answer' ? 'field=value' : kind === 'cmd' ? 'menu|stop|ask|back' : kind === 'consent' ? 'grant|decline|revoke_marketing' : kind === 'contact' ? 'phone|telegram' : kind === 'lesson' ? 'open|watched' : kind === 'submit' ? 'send|edit' : 'a|b|c'} />
+                  <input style={{ width: 210 }} value={rest} onChange={(e) => setBtn(i, { action: kind + ':' + e.target.value })} placeholder={kind === 'answer' ? 'field=value' : kind === 'cmd' ? 'menu|stop|ask|back|edit' : kind === 'consent' ? 'grant_marketing|no_reminders|grant_contact|decline|revoke_marketing' : kind === 'notif' ? 'marketing|lessons|off|on' : kind === 'contact' ? 'phone|telegram' : kind === 'lesson' ? 'open|watched|resend|remind_tomorrow' : kind === 'submit' ? 'send|edit' : 'right|wrong|help'} />
                 )}
                 <label className="row" title="O'chirilgan tugma botda ko'rsatilmaydi, lekin saqlanadi">
                   <input style={{ width: 15 }} type="checkbox" checked={x.hidden} onChange={(e) => setBtn(i, { hidden: e.target.checked })} /> o&apos;chiq

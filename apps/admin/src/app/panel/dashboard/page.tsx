@@ -18,8 +18,10 @@ export default function Dashboard() {
   const NAMES: Record<string, string> = {
     bot_start: 'Bot boshladi',
     'link_token_claimed': 'Havola orqali keldi',
-    'stage:INTRO_VIDEO': 'Tanishuv videoni ko\'rdi',
+    'stage:START': 'Kirishni ko\'rdi',
+    'stage:EXPERIENCE_VIDEO': 'Tajriba videosini ko\'rdi',
     'stage:LESSON_INTRO': 'Sinov darsiga kirdi',
+    task_answered: 'Task javob berdi',
     lesson_self_reported_watched: 'Darsni ko\'rdim dedi',
     'stage:OFFERS': 'Takliflarni ko\'rdi',
     sales_lead_created: 'Sotuvga ariza',

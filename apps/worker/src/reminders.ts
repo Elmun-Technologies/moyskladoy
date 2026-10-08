@@ -3,9 +3,10 @@
 //  - intro: tanishuv bosqichlarida 24+ soat turganlarga - kuniga 1 marta
 //  - lesson: dars havolasini bosgan, lekin "ko'rdim" demagan - +24h
 //  - offers: takliflar bosqichida 24+ soat - 1 marta
-//  - review: xarid tasdiqlanganlardan 7 kun so'ng - HAYOTIDA BIR marta
+//  - week1: sotuvga uzatilgan foydalanuvchiga 7 kundan keyin - BIR marta (41)
 //  - nurture: faol marketing roziligi bo'lganlarga dushanba/payshanba
-//    `tip_*` bloklaridan - har tip har foydalanuvchiga 1 marta; tugasa - jim
+//    `tip_*` bloklaridan - har tip har foydalanuvchiga 1 marta; tugasa - jim.
+//   notif_scope='lessons' (47-sozlamalar) bo'lsa - tips YUBORILMAYDI
 // Barcha navbatlar idempotent (dedupeKey). Eski xabarlarsiz "cheksiz sikl" YO'Q.
 // ============================================================================
 import { DateTime } from 'luxon';
@@ -24,15 +25,18 @@ export async function scheduleRules(db: Database, now: Date = new Date(), limitU
     if (!st || u.blockedAt) continue;
     if (st.humanHandling) continue;
     if (st.salesStatus === 'in_sales' || st.salesStatus === 'purchased') {
-      // xarid tasdiqlangan - 1 marta fikr so'rash (oddiy holat: reminder_review event)
-      if (st.salesStatus === 'purchased') {
-        const sentBefore = await db.listEventsByType('outbox_sent:reminder_review', now, 1);
-        void sentBefore;
-        const reviewDedup = `reminder:${u.id}:review:once`;
-        const doneEvent = (await db.listEvents(u.id, 200)).some((e) => e.type === 'review_requested');
+      // 41-qoida: sotuvga uzatilgan bo'lsa - birinchi hafta oxirida 1 marta.
+      if (st.salesStatus === 'in_sales' && st.stage === 'SUBMITTED') {
+        const doneEvent = (await db.listEvents(u.id, 200)).some((e) => e.type === 'week1_sent');
         if (!doneEvent && st.updatedAt.getTime() < now.getTime() - 7 * DAY_MS) {
-          const r = await db.enqueueOutbox({ userId: u.id, type: 'reminder', dedupeKey: reviewDedup, payload: { blockKey: 'reminder_review' }, scheduledFor: clampWindow(now) });
-          if (r) { await db.recordEvent('review_requested', { userId: u.id, dedupeKey: `review:${u.id}` }); enqueued++; }
+          const r = await db.enqueueOutbox({
+            userId: u.id,
+            type: 'reminder',
+            dedupeKey: `reminder:${u.id}:week1:once`,
+            payload: { blockKey: 'reminder_week1' },
+            scheduledFor: clampWindow(now),
+          });
+          if (r) { await db.recordEvent('week1_sent', { userId: u.id, dedupeKey: `week1:${u.id}` }); enqueued++; }
         }
       }
       continue;
@@ -49,7 +53,7 @@ export async function scheduleRules(db: Database, now: Date = new Date(), limitU
     } else {
       // nurture: dushanba(1)/payshanba(4), 5+ kundan keyin
       const dow = DateTime.fromJSDate(now, { zone: TASHKENT_ZONE }).weekday;
-      if ((dow === 1 || dow === 4) && idleMs >= 5 * DAY_MS) {
+      if ((dow === 1 || dow === 4) && idleMs >= 5 * DAY_MS && st.answers.notif_scope !== 'lessons') {
         const tips = (await db.listBlocks({ status: 'approved' })).filter((b) => b.key.startsWith('tip_'));
         const userEvents = await db.listEvents(u.id, 500);
         const seen = new Set(userEvents.filter((e) => e.type === 'tip_sent').map((e) => (e.payload as { key?: string } | null)?.key));

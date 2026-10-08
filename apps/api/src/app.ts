@@ -171,7 +171,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // --- stats -----------------------------------------------------------------
   app.get('/api/admin/stats', async (req, reply) => {
     return withAuth(req, reply, ALL, false, async () => {
-      const stages = ['bot_start', 'stage:INTRO_VIDEO', 'stage:LESSON_INTRO', 'lesson_self_reported_watched', 'stage:OFFERS', 'sales_lead_created', 'link_token_claimed'];
+            const stages = ['bot_start', 'stage:START', 'stage:EXPERIENCE_VIDEO', 'stage:LESSON_INTRO', 'task_answered', 'lesson_self_reported_watched', 'stage:OFFERS', 'sales_lead_created', 'link_token_claimed'];
       const funnel: Record<string, { total: number; users: number }> = {};
       for (const t of stages) {
         funnel[t] = { total: await db.countEvents(t), users: await db.countUniqueUsers(t) };
@@ -287,18 +287,34 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             .optional(),
           requiresMedia: z.boolean().optional(),
           textFallbackAllowed: z.boolean().optional(),
+          videoScript: z.string().max(4000).nullable().optional(),
+          showCondition: z
+            .object({
+              lessonLinkRequired: z.boolean().optional(),
+              requiresVisibleProducts: z.boolean().optional(),
+              requiresAnswer: z.string().max(40).optional(),
+              skipIfMarketingConsent: z.boolean().optional(),
+              onlyStages: z.array(z.string().max(40)).max(60).optional(),
+              requiredSettings: z
+                .array(z.string().regex(/^[a-z0-9_]{1,40}$/))
+                .max(6)
+                .optional(),
+            })
+            .nullable()
+            .optional(),
         })
         .safeParse(req.body);
       if (!b.success) return reply.code(400).send({ ok: false, error: 'validation' });
       const ACTION_PATTERNS: RegExp[] = [
         /^goto:[A-Z_]{2,40}$/,
         /^answer:[a-z_]{1,30}=[a-z0-9_]{1,40}$/,
-        /^task:[abc]$/,
-        /^lesson:(open|watched)$/,
-        /^consent:(grant|decline|revoke_marketing)$/,
+        /^task:[a-z0-9_]{1,20}$/,
+        /^lesson:(open|watched|resend|remind_tomorrow)$/,
+        /^consent:(grant|grant_marketing|no_reminders|grant_contact|decline|revoke_marketing)$/,
+        /^notif:(marketing|lessons|off|on)$/,
         /^contact:(phone|telegram)$/,
         /^submit:(send|edit)$/,
-        /^cmd:(menu|stop|ask|back)$/,
+        /^cmd:(menu|stop|ask|back|edit)$/,
       ];
       const btnErrors: string[] = [];
       for (const btn of b.data.buttons ?? []) {
@@ -331,7 +347,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         mediaId: b.data.mediaId ?? null,
         mediaSourceUrl: b.data.mediaSourceUrl ?? null,
         buttons: b.data.buttons ?? cur?.buttons ?? [],
-        showCondition: cur?.showCondition ?? null,
+        videoScript: b.data.videoScript ?? cur?.videoScript ?? null,
+        showCondition: (b.data.showCondition !== undefined ? (b.data.showCondition ?? null) : (cur?.showCondition ?? null)) as never,
         status: 'draft',
         textFallbackAllowed: b.data.textFallbackAllowed ?? true,
         requiresMedia: b.data.requiresMedia ?? false,

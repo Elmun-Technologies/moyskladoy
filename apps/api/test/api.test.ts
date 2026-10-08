@@ -136,7 +136,7 @@ describe('auth, csrf, roles', () => {
     expect(price.statusCode).toBe(403);
     // ariza yaratamiz va claim qilamiz
     await app.inject({ method: 'POST', url: '/api/bot/simulate', payload: { telegramId: 903, text: '/start', updateId: 33000 } });
-    await app.inject({ method: 'POST', url: '/api/bot/simulate', payload: { telegramId: 903, data: 'consent:grant', updateId: 33001 } });
+    await app.inject({ method: 'POST', url: '/api/bot/simulate', payload: { telegramId: 903, data: 'consent:grant_contact', updateId: 33001 } });
     await app.inject({ method: 'POST', url: '/api/bot/simulate', payload: { telegramId: 903, data: 'contact:telegram', updateId: 33002 } });
     await app.inject({ method: 'POST', url: '/api/bot/simulate', payload: { telegramId: 903, data: 'submit:send', updateId: 33003 } });
     const user = await db.getUserByTelegramId(903);

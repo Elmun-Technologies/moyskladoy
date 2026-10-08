@@ -14,7 +14,6 @@ import {
 } from '@app/shared';
 import { CONTENT_BLOCKS } from './content-uz.js';
 import { PRODUCTS } from './products.js';
-import { TIPS } from './tips.js';
 
 export async function applySeed(db: Database, onLog: (m: string) => void = (m) => console.log(m)): Promise<void> {
 
@@ -24,27 +23,7 @@ export async function applySeed(db: Database, onLog: (m: string) => void = (m) =
   }
   onLog(`[seed] content blocks upserted: ${CONTENT_BLOCKS.length}`);
 
-  // 2) Nurture tips - alohida bloklar (stage=null), worker ularni
-  //    `tip_` kaliti bo'yicha oladi. Har bir foydalanuvchiga har tip 1 marta.
-  let tipCount = 0;
-  for (const t of TIPS) {
-    await db.upsertBlock({
-      key: t.key,
-      stage: null,
-      title: t.title,
-      body: t.body,
-      mediaType: 'text',
-      mediaId: null,
-      mediaSourceUrl: null,
-      buttons: [],
-      showCondition: null,
-      status: 'approved',
-      textFallbackAllowed: true,
-      requiresMedia: false,
-    });
-    tipCount++;
-  }
-  onLog(`[seed] nurture tips upserted: ${tipCount}`);
+  // 2) Nurture tips - endi CONTENT_BLOCKS ichida (tip_cash/debt/slow/owner, 42-45).
 
   // 3) Products + initial version.
   for (const p of PRODUCTS) {

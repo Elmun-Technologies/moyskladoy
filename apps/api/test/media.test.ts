@@ -56,7 +56,7 @@ describe('blok tugmalari nazorati', () => {
 
   it('katalogdagi mediaId qabul qilinadi', async () => {
     await db.createMedia({ originalName: 'intro.mp4', mimeType: 'video/mp4', sizeBytes: 100, durationSec: 10, isVideoNote: true, fileId: 'REAL_ID_1', sourceUrl: null, status: 'approved', formatChecked: true, uploadedById: null });
-    const r = await app.inject({ method: 'POST', url: '/api/admin/blocks', headers: h(), payload: { key: 'intro_video', stage: 'INTRO_VIDEO', title: 'Tanishuv', body: 'x', mediaType: 'video_note', mediaId: 'REAL_ID_1', requiresMedia: true, buttons: [] } });
+    const r = await app.inject({ method: 'POST', url: '/api/admin/blocks', headers: h(), payload: { key: 'intro_video', stage: 'CLIENT_REVIEW', title: 'Mijoz fikri uchun media', body: 'x', mediaType: 'video_note', mediaId: 'REAL_ID_1', requiresMedia: true, buttons: [] } });
     expect(r.statusCode).toBe(200);
   });
 });
