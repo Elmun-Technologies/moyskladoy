@@ -348,3 +348,22 @@ describe('windows and statuses', () => {
     expect(lastText(TG.id)).toContain('Qaysini tanlaysiz?'); // savol tugmalari blokiyani ko'rsatadi
   });
 });
+
+describe('panel tugma nazorati', () => {
+  it("25. hidden=true tugma botda yuborilmaydi, ochiqlari qoladi", async () => {
+    const cur = await db.getBlockByKey('menu', 'approved');
+    expect(cur).not.toBeNull();
+    await db.upsertBlock({
+      ...cur!,
+      buttons: [
+        { label: 'Bosh sahifa', action: 'cmd:menu', hidden: true },
+        { label: 'Takliflar', action: 'goto:OFFERS', hidden: false },
+      ],
+    });
+    await start();
+    const last = msg.last(TG.id);
+    const actions = (last?.buttons ?? []).flat().map((b) => b.action);
+    expect(actions).not.toContain('cmd:menu');
+    expect(actions).toContain('goto:OFFERS');
+  });
+});

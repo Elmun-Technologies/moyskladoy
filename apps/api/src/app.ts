@@ -11,9 +11,9 @@ import rateLimit from '@fastify/rate-limit';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import type { AdminRole, Database } from '@app/shared';
-import { CONSENT_TEXT_VERSION, SETTING_KEYS } from '@app/shared';
+import { CONSENT_TEXT_VERSION, SETTING_KEYS, toPlainText } from '@app/shared';
 import type { ApiConfig } from './config.js';
-import { hashIp } from './security.js';
+import { hashIp, validateUploadName } from './security.js';
 
 export interface AppDeps {
   db: Database;
@@ -281,12 +281,45 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           mediaType: z.enum(['video_note', 'video', 'image', 'text']).nullable().optional(),
           mediaId: z.string().max(200).nullable().optional(),
           mediaSourceUrl: z.string().max(500).nullable().optional(),
-          buttons: z.array(z.object({ label: z.string().max(64), action: z.string().max(64) })).max(12).optional(),
+          buttons: z
+            .array(z.object({ label: z.string().min(1).max(64), action: z.string().min(1).max(64), hidden: z.boolean().optional() }))
+            .max(12)
+            .optional(),
           requiresMedia: z.boolean().optional(),
           textFallbackAllowed: z.boolean().optional(),
         })
         .safeParse(req.body);
       if (!b.success) return reply.code(400).send({ ok: false, error: 'validation' });
+      const ACTION_PATTERNS: RegExp[] = [
+        /^goto:[A-Z_]{2,40}$/,
+        /^answer:[a-z_]{1,30}=[a-z0-9_]{1,40}$/,
+        /^task:[abc]$/,
+        /^lesson:(open|watched)$/,
+        /^consent:(grant|decline|revoke_marketing)$/,
+        /^contact:(phone|telegram)$/,
+        /^submit:(send|edit)$/,
+        /^cmd:(menu|stop|ask|back)$/,
+      ];
+      const btnErrors: string[] = [];
+      for (const btn of b.data.buttons ?? []) {
+        const known = ACTION_PATTERNS.some((re2) => re2.test(btn.action));
+        if (!known) {
+          btnErrors.push("tugma amali ru'xsat etilmagan: " + btn.action.slice(0, 48));
+          continue;
+        }
+        const g = /^goto:([A-Z_]+)$/.exec(btn.action);
+        if (g) {
+          const target = await db.getBlockByStage(g[1]!, 'approved');
+          if (!target) btnErrors.push("goto maqsadida tasdiqlangan blok yo'q: " + btn.action);
+        }
+      }
+      if (btnErrors.length > 0) return reply.code(422).send({ ok: false, error: 'buttons_invalid', details: btnErrors });
+      if (b.data.mediaId) {
+        const catalog = await db.listMedia();
+        if (!catalog.some((m) => m.fileId === b.data.mediaId)) {
+          return reply.code(422).send({ ok: false, error: 'media_not_in_catalog', hint: "Avval Media bo'limidan file_id oling yoki fayl yuklang" });
+        }
+      }
       // Saqlash DRAFT sifatida - faqat approve'dan keyin bot yuboradi.
       const cur = await db.getBlockByKey(b.data.key, 'approved');
       const block = await db.upsertBlock({
@@ -303,7 +336,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         textFallbackAllowed: b.data.textFallbackAllowed ?? true,
         requiresMedia: b.data.requiresMedia ?? false,
       });
-      await db.audit({ before: null, actorId: s.adminId, action: 'block_save_draft', entity: 'content_block', entityId: block.id, after: { key: block.key, version: block.version }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });;
+      await db.audit({ actorId: s.adminId, action: 'block_save_draft', entity: 'content_block', entityId: block.id, before: null, after: { key: block.key, version: block.version, buttons: (block.buttons ?? []).length }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
       return reply.send({ ok: true, id: block.id, version: block.version });
     });
   });
@@ -485,6 +518,90 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       });
       await db.audit({ actorId: s.adminId, action: 'media_create', entity: 'media', entityId: m.id, before: null, after: { name: m.originalName }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
       return reply.send({ ok: true, id: m.id });
+    });
+  });
+
+  // --- media upload: fayl -> (Telegram bo'lsa) file_id; bo'lmasa katalog+disk --
+  app.post('/api/admin/media/upload', { bodyLimit: 24 * 1024 * 1024 }, async (req, reply) => {
+    return withAuth(req, reply, ['admin', 'content_editor'], true, async (s) => {
+      const b = z
+        .object({
+          originalName: z.string().min(1).max(160),
+          mime: z.string().min(3).max(80),
+          dataBase64: z.string().min(8).max(32 * 1024 * 1024),
+          isVideoNote: z.boolean().default(true),
+          targetChatId: z.number().int().nullable().optional(),
+        })
+        .safeParse(req.body);
+      if (!b.success) return reply.code(400).send({ ok: false, error: 'validation' });
+      const buf = Buffer.from(b.data.dataBase64, 'base64');
+      const maxBytes = Number(process.env.MEDIA_MAX_BYTES ?? 52428800);
+      const bad = validateUploadName(b.data.originalName, b.data.mime, buf.length, maxBytes);
+      if (bad) return reply.code(422).send({ ok: false, error: bad, hint: "Ruxsat: jpg/png rasm; mp4/mov video. Round video = mp4, 60 sekundgacha" });
+      const token = process.env.TELEGRAM_BOT_TOKEN ?? null;
+      const chatId = b.data.targetChatId ?? null;
+      if (token && chatId) {
+        // Haqiqiy Telegram upload: chat'ga yuborib file_id'ni olamiz.
+        try {
+          const { Bot, InputFile } = await import('grammy');
+          const bot = new Bot(token);
+          let fileId: string | null = null;
+          let durationSec: number | null = null;
+          let kind = 'video';
+          if (b.data.isVideoNote && /^video\/(mp4|quicktime)$/.test(b.data.mime)) {
+            const m = await bot.api.sendVideoNote(chatId, new InputFile(buf, b.data.originalName) as never);
+            fileId = (m.video_note as { file_id: string }).file_id;
+            kind = 'video_note';
+          } else if (b.data.mime.startsWith('image/')) {
+            const m = await bot.api.sendPhoto(chatId, new InputFile(buf, b.data.originalName) as never);
+            const photos = m.photo as { file_id: string }[];
+            fileId = photos[photos.length - 1]!.file_id;
+            kind = 'image';
+          } else {
+            const m = await bot.api.sendVideo(chatId, new InputFile(buf, b.data.originalName) as never);
+            const v = m.video as { file_id: string; duration?: number };
+            fileId = v.file_id;
+            durationSec = v.duration ?? null;
+          }
+          const media = await db.createMedia({
+            originalName: b.data.originalName,
+            mimeType: b.data.mime,
+            sizeBytes: buf.length,
+            durationSec,
+            isVideoNote: b.data.isVideoNote && kind === 'video_note',
+            fileId,
+            sourceUrl: null,
+            status: 'approved',
+            formatChecked: true,
+            uploadedById: s.adminId,
+          });
+          await db.audit({ actorId: s.adminId, action: 'media_upload_telegram', entity: 'media', entityId: media.id, before: null, after: { kind, size: buf.length }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+          return reply.send({ ok: true, id: media.id, fileId, via: 'telegram' });
+        } catch (e) {
+          return reply.code(502).send({ ok: false, error: 'telegram_upload_failed', reason: toPlainText((e as Error).message).slice(0, 160), hint: "Bot bilan chat ochiq bo'lishi kerak; format: round=mp4<=60s" });
+        }
+      }
+      // Token/chat yo'q (demo): fayl diskda saqlanadi, file_id keyin bog'lanadi.
+      const { writeFile, mkdir } = await import('node:fs/promises');
+      const dir = process.env.MEDIA_DIR ?? 'uploads';
+      await mkdir(dir, { recursive: true });
+      const ext = (b.data.originalName.split('.').pop() ?? 'bin').toLowerCase();
+      const stored = 'med_' + randomBytes(6).toString('hex') + '.' + ext;
+      await writeFile(dir + '/' + stored, buf);
+      const media = await db.createMedia({
+        originalName: b.data.originalName,
+        mimeType: b.data.mime,
+        sizeBytes: buf.length,
+        durationSec: null,
+        isVideoNote: b.data.isVideoNote,
+        fileId: null,
+        sourceUrl: 'file://' + dir + '/' + stored,
+        status: 'uploaded',
+        formatChecked: false,
+        uploadedById: s.adminId,
+      });
+      await db.audit({ actorId: s.adminId, action: 'media_upload_local', entity: 'media', entityId: media.id, before: null, after: { size: buf.length }, ip: hashIp(req.ip ?? '', cfg.ipHashSalt) });
+      return reply.send({ ok: true, id: media.id, fileId: null, via: 'local', note: 'TELEGRAM_BOT_TOKEN + targetChatId berilsa file_id avtomatik olinadi' });
     });
   });
 

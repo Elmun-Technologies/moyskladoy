@@ -75,6 +75,8 @@ export interface ButtonDef {
   /** Callback action: goto:STAGE | answer:field=value | cmd:menu | lesson:open | task:11 | submit:send ... */
   action: string;
   label: string;
+  /** Panel'dan o'chirilgan (off) tugma - bot uni YUBORMAYDI, lekin saqlanadi. */
+  hidden?: boolean;
 }
 
 /** Ko'rsatish sharti - engine blokni ko'rsatishdan oldin tekshiradi. */

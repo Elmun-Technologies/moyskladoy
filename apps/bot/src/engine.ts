@@ -169,7 +169,8 @@ export class BotEngine {
 
   private async filterButtons(user: TelegramUser, state: ConversationState, block: ContentBlock): Promise<ButtonDef[]> {
     const cond = block.showCondition;
-    let buttons = block.buttons;
+    // Panel'dan 'o'chirilgan' (hidden) tugmalar yuborilmaydi.
+    let buttons = block.buttons.filter((b) => b.hidden !== true);
     if (cond?.lessonLinkRequired) {
       const link = await this.setting(SETTING_KEYS.lessonLink);
       if (typeof link !== 'string' || !link) buttons = buttons.filter((b) => b.action !== 'lesson:open');
